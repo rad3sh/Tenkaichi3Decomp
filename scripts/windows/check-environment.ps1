@@ -19,6 +19,7 @@ $sevenZip = Get-Bt3ToolPath '7z.exe'
 $dxc = Get-Bt3ToolPath 'dxc.exe'
 $ninja = Get-Bt3ToolPath 'ninja.exe'
 $pythonLauncher = Get-Bt3ToolPath 'py.exe'
+$sdlSdk = $Bt3Sdl3Sdk
 
 Add-Check 'Visual Studio developer environment' ($null -ne $vsdev) $vsdev 'MSVC environment activation'
 Add-Check 'Windows SDK' ($null -ne $sdk) $sdk 'Win32 and Direct3D headers/libraries'
@@ -31,6 +32,9 @@ Add-Check '7-Zip' ($null -ne $sevenZip) $sevenZip 'Disc extraction'
 Add-Check 'DirectX Shader Compiler' ($null -ne $dxc) $dxc 'Shader compilation for future backends'
 Add-Check 'CDB' ($null -ne $cdb) $cdb 'Command-line native debugging'
 Add-Check 'SDL3 runtime' (Test-Path 'C:\Program Files\SDL3\lib\SDL3.dll') 'C:\Program Files\SDL3\lib\SDL3.dll' 'Window/input/audio layer'
+Add-Check 'SDL3 development headers' (Test-Path (Join-Path $sdlSdk 'include\SDL3\SDL.h')) (Join-Path $sdlSdk 'include\SDL3\SDL.h') 'Windows compilation'
+Add-Check 'SDL3 x64 import library' (Test-Path (Join-Path $sdlSdk 'lib\x64\SDL3.lib')) (Join-Path $sdlSdk 'lib\x64\SDL3.lib') 'x64 linking'
+Add-Check 'SDL3 x86 import library' (Test-Path (Join-Path $sdlSdk 'lib\x86\SDL3.lib')) (Join-Path $sdlSdk 'lib\x86\SDL3.lib') 'x86 linking'
 Add-Check 'Git' ($null -ne (Get-Command git.exe -ErrorAction SilentlyContinue)) ((Get-Command git.exe -ErrorAction SilentlyContinue).Source) 'Source control'
 
 if ($Json) {

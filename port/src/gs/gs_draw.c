@@ -1869,8 +1869,12 @@ int GsGpu_Init(void) {
         sb = &sVulkanBackend;
     } else if (strcmp(api, "gl") == 0 || strcmp(api, "opengl") == 0) {
         sb = &sGlBackend;
+#ifdef _WIN32
+    } else if (strcmp(api, "d3d9") == 0) {
+        sb = &sD3d9Backend;
+#endif
     } else {
-        fprintf(stderr, "bt3: unknown BT3_GPU_API=%s (try vulkan, gl or auto)\n", api);
+        fprintf(stderr, "bt3: unknown BT3_GPU_API=%s (try vulkan, gl, d3d9 or auto)\n", api);
         return 0;
     }
     sBackend = sb;

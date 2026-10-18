@@ -134,7 +134,7 @@ extern uint64_t gGpuTexNs, gGpuPipeNs, gGpuEndNs;
    end's: the shared layer only hands it handles and asks for the few numbers it must know (whether it can
    still take a texture this frame, a target's attachments). */
 typedef struct GsBackend {
-    const char *name;                     /* "vulkan", "opengl" */
+    const char *name;                     /* "vulkan", "opengl", "d3d9" */
     int (*init)(void);                    /* window + device + fixed pipelines + white texture; 0 = failed */
     void (*frameEnd)(void);               /* events, uploads, replay the list, present, UI, screenshots */
     void (*scaleChanged)(void);           /* gsScale just changed: wait idle, drop and rebuild what is sized */
@@ -155,6 +155,9 @@ typedef struct GsBackend {
 
 extern GsBackend sVulkanBackend; /* gs_gpu.c */
 extern GsBackend sGlBackend;     /* gs_gl.c */
+#ifdef _WIN32
+extern GsBackend sD3d9Backend;   /* gs_d3d9.c */
+#endif
 
 /* gs_draw.c: the shared target table's entry for a frame-buffer address (create: one is made if absent,
    with the back end's attachments through GsBackend.targetEnsure). */

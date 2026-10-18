@@ -21,9 +21,10 @@ The bootstrap script installs official packages through `winget`, writes a times
 .\scripts\windows\check-environment.ps1 -Json
 ```
 
-The compiler and SDK are installed outside the repository. Proprietary Microsoft binaries are intentionally not
-committed. The scripts discover the standard Build Tools and Windows SDK locations, so another developer can use
-the same branch on a clean Windows machine.
+The compiler and Windows SDK are installed outside the repository. Proprietary Microsoft binaries are intentionally not
+committed. The scripts discover the standard Build Tools and Windows SDK locations. The SDL3 VC development archive is
+kept in the ignored `.cache/SDL3/` directory because the repository needs its headers and import libraries to compile
+Windows targets; it is downloaded from the official SDL release archive by the setup process.
 
 ## Direct3D 9 SDK validation
 
@@ -33,6 +34,7 @@ with debug information:
 ```powershell
 .\scripts\windows\build-probe.ps1 -Architecture x64
 .\scripts\windows\build-probe.ps1 -Architecture x86
+.\scripts\windows\build-d3d9-bootstrap.ps1 -Architecture x64
 ```
 
 Probe outputs and intermediate files are written to `build/windows/`, which is ignored by Git. The x86 probe is
@@ -65,8 +67,16 @@ $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbo
 
 The `logs/` directory is local state and should not be committed. The scripts create it automatically.
 
+The visual backend probe also writes `build/windows/d3d9_backend_probe.ppm` and validates the PPM source pixels,
+RGBA8 upload, DXT1 upload, target readback, and target copy. It is run with:
+
+```powershell
+.\scripts\windows\run-d3d9-backend-probe.ps1 -Architecture x64
+```
+
 ## Current scope
 
-This branch prepares the Windows CLI environment only. The Direct3D 9 renderer belongs on the separate feature
-branch. The existing Linux/macOS build remains unchanged. The future renderer branch should consume this setup
-through the same MSVC/Windows SDK environment and preserve the existing Vulkan/OpenGL backends.
+This branch prepares the Windows CLI environment and the first native D3D9 backend path. The existing Linux/macOS
+build remains unchanged. The renderer uses the same MSVC/Windows SDK environment and preserves the existing
+Vulkan/OpenGL backends. It supports RGBA8 and DXT1/DXT3/DXT5 texture upload paths and target readback probes; the
+full game build and VU shader path are still pending.

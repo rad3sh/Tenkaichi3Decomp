@@ -33,6 +33,7 @@ install.log
 port/build_release/
 /build/windows/
 /logs/
+/.cache/
 *.obj
 *.pdb
 

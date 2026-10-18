@@ -8,6 +8,7 @@ $script:Bt3WindowsRoot = Split-Path -Parent $PSScriptRoot
 $script:Bt3RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $script:Bt3LogRoot = Join-Path $script:Bt3RepoRoot 'logs'
 $script:Bt3BuildRoot = Join-Path $script:Bt3RepoRoot 'build\windows'
+$script:Bt3Sdl3Sdk = Join-Path $script:Bt3RepoRoot '.cache\SDL3\sdk\SDL3-3.4.14'
 
 function Get-Bt3VsDevCmd {
     $candidates = @(
@@ -92,5 +93,6 @@ function Get-Bt3EnvironmentSummary {
         SevenZip = Get-Bt3ToolPath '7z.exe'
         Dxc = Get-Bt3ToolPath 'dxc.exe'
         Sdl3Runtime = Test-Path 'C:\Program Files\SDL3\lib\SDL3.dll'
+        Sdl3Sdk = $script:Bt3Sdl3Sdk
     }
 }
