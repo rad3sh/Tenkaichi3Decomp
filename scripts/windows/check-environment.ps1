@@ -35,6 +35,10 @@ Add-Check 'SDL3 runtime' (Test-Path 'C:\Program Files\SDL3\lib\SDL3.dll') 'C:\Pr
 Add-Check 'SDL3 development headers' (Test-Path (Join-Path $sdlSdk 'include\SDL3\SDL.h')) (Join-Path $sdlSdk 'include\SDL3\SDL.h') 'Windows compilation'
 Add-Check 'SDL3 x64 import library' (Test-Path (Join-Path $sdlSdk 'lib\x64\SDL3.lib')) (Join-Path $sdlSdk 'lib\x64\SDL3.lib') 'x64 linking'
 Add-Check 'SDL3 x86 import library' (Test-Path (Join-Path $sdlSdk 'lib\x86\SDL3.lib')) (Join-Path $sdlSdk 'lib\x86\SDL3.lib') 'x86 linking'
+Add-Check 'MSYS2 UCRT64 GCC' (Test-Path (Join-Path $Bt3MsysUcrt 'bin\gcc.exe')) (Join-Path $Bt3MsysUcrt 'bin\gcc.exe') 'win64 game compilation'
+Add-Check 'MSYS2 UCRT64 GDB' (Test-Path (Join-Path $Bt3MsysUcrt 'bin\gdb.exe')) (Join-Path $Bt3MsysUcrt 'bin\gdb.exe') 'MinGW command-line debugging'
+Add-Check 'MSYS2 UCRT64 SDL3 headers' (Test-Path (Join-Path $Bt3MsysUcrt 'include\SDL3\SDL.h')) (Join-Path $Bt3MsysUcrt 'include\SDL3\SDL.h') 'win64 SDL3 compilation'
+Add-Check 'MSYS2 UCRT64 SDL3 library' (Test-Path (Join-Path $Bt3MsysUcrt 'lib\libSDL3.dll.a')) (Join-Path $Bt3MsysUcrt 'lib\libSDL3.dll.a') 'win64 SDL3 linking'
 Add-Check 'Git' ($null -ne (Get-Command git.exe -ErrorAction SilentlyContinue)) ((Get-Command git.exe -ErrorAction SilentlyContinue).Source) 'Source control'
 
 if ($Json) {
