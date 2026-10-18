@@ -559,12 +559,14 @@ static void d3d9_gs_ps_release(void) {
      c4 extra: x=0, y=blendc (extra.y in GLSL), z=0, w=0 */
 static void d3d9_gs_ps_set_constants(const GsDraw *draw) {
     float c0[4], c4[4];
+    uint32_t pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     c0[0] = (float)draw->mode[0];
     c0[1] = (float)draw->mode[1];
     c0[2] = (float)draw->mode[2];
     c0[3] = (float)draw->mode[3];
-    c4[0] = 0.0f;                /* depth max unused */
-    c4[1] = draw->blendc;        /* extra.y: pre-multiply flag */
+    c4[0] = draw->vu && draw->uniform >= 0 && (uint32_t)draw->uniform < gsVuUniCount && gsVuUni[draw->uniform].misc[2] > 0.0f
+                 ? gsVuUni[draw->uniform].misc[2] : 0.0f; /* depth max for the PS depth convention */
+    c4[1] = (pipelineKey & (1u << 9)) != 0 ? 1.0f : 0.0f; /* extra.y: GS source-alpha premultiply flag */
     c4[2] = 0.0f;
     c4[3] = 0.0f;
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 0, c0,         1);
