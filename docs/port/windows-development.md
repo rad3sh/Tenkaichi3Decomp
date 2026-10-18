@@ -67,6 +67,10 @@ $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbo
 
 The `logs/` directory is local state and should not be committed. The scripts create it automatically.
 
+The default D3D9/game window starts at `640x480`, a compact size close to the PS2 picture. Use
+`BT3_WINDOW=WxH` to request another size, for example `BT3_WINDOW=1024x896`. The experimental D3D9 GS
+pixel shader is disabled by default while its alpha/composition behavior is being matched; enable it for testing
+with `BT3_D3D9_PIXEL_SHADER=1`.
 The visual backend probe also writes `build/windows/d3d9_backend_probe.ppm` and validates the PPM source pixels,
 RGBA8 upload, DXT1 upload, target readback, and target copy. It is run with:
 

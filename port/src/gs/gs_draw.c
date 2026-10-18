@@ -1678,7 +1678,7 @@ static void menu_labels_apply(void) {
 SDL_Window *GsDraw_WindowCreate(int opengl) {
     extern int Port_AspectMilli(void);
     float want = (float)Port_AspectMilli() / 1000.0f;
-    int h = 896, w = (int)((float)h * want + 0.5f), count = 0, pick = 0;
+    int h = 480, w = 640, explicitSize = 0, count = 0, pick = 0;
     SDL_DisplayID *displays;
     SDL_PropertiesID props;
 
@@ -1690,8 +1690,12 @@ SDL_Window *GsDraw_WindowCreate(int opengl) {
     props = SDL_CreateProperties();
     /* The window has the picture's shape: 896 lines high, 4:3 or 16:9 wide (1195 x 896 or 1593 x 896), and
        keeps that shape when it is resized. BT3_WINDOW=WxH gives another start size. */
-    if (getenv("BT3_WINDOW") != NULL) {
-        sscanf(getenv("BT3_WINDOW"), "%dx%d", &w, &h);
+    if (getenv("BT3_WINDOW") != NULL && sscanf(getenv("BT3_WINDOW"), "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+        explicitSize = 1;
+    }
+    if (!explicitSize) {
+        w = 640;
+        h = 480;
     }
     /* BT3_DISPLAY=n: the n-th display (1 = first) for the window or the full screen; without it the desktop
        places the window. Some desktops (Wayland) ignore a window's position but honour the display of a
@@ -1722,8 +1726,8 @@ SDL_Window *GsDraw_WindowCreate(int opengl) {
     sWindow = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     SDL_free(displays);
-    if (sWindow != NULL && !sFullscreen) {
-        SDL_SetWindowSize(sWindow, (int)((float)896 * want + 0.5f), 896);
+    if (sWindow != NULL && !sFullscreen && !explicitSize) {
+        SDL_SetWindowSize(sWindow, w, h);
     }
     fprintf(stderr, "bt3: internal resolution %dx (%d x %d)\n", gsScale, 512 * gsScale, 448 * gsScale);
     return sWindow;
@@ -4340,7 +4344,19 @@ void GsGpu_FrameEnd(void) {
             }
         }
         if (gsInterp < 0) {
-            gsInterp = getenv("BT3_INTERP") != NULL ? atoi(getenv("BT3_INTERP")) : Port_Setting("interp", 0);
+            const char *api = getenv("BT3_GPU_API");
+            const char *override = getenv("BT3_D3D9_INTERP");
+            if (getenv("BT3_INTERP") != NULL) {
+                gsInterp = atoi(getenv("BT3_INTERP"));
+            } else if (api != NULL && strcmp(api, "d3d9") == 0 && override == NULL) {
+                /* D3D9 now replays the same fixed 30 Hz tick schedule as the other backends. Texture coordinates
+                   remain tied to each real GS picture, so menu animation no longer alternates at half-tick timing. */
+                gsInterp = Port_Setting("interp", 0);
+            } else if (override != NULL) {
+                gsInterp = atoi(override);
+            } else {
+                gsInterp = Port_Setting("interp", 0);
+            }
             gsInterp = gsInterp < 0 ? 0 : gsInterp > 3 ? 3 : gsInterp;
             sInterpPrev = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));
             sInterpBlend = malloc(MAX_VU_UNIFORMS * sizeof(Vu0Uniform));

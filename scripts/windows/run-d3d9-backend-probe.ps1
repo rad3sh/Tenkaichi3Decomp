@@ -30,6 +30,7 @@ $log = New-Bt3Log "d3d9-backend-probe-$Architecture"
 #include <windows.h>
 #include <SDL3/SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "gs_draw.h"
 
@@ -52,9 +53,18 @@ SDL_Window *GsDraw_WindowCreate(int opengl) {
 }
 
 int gsScale = 1;
+int Port_PageAspectMilli(void) { return 1143; }
+const char *Port_GetEnv(const char *name) { return getenv(name); }
+volatile int gUiPresentX, gUiPresentY, gUiPresentW, gUiPresentH;
 GsDraw *gsDraws = NULL;
 uint32_t gsDrawCount = 0;
 Vtx *gsVerts = NULL;
+float *gsVuVerts = NULL;
+uint32_t *gsVuIdx = NULL;
+Vu0Uniform *gsVuUni = NULL;
+uint32_t gsVuUniCount = 0;
+uint32_t gsVuVertCount = 0;
+uint32_t gsVuIdxCount = 0;
 
 static int write_ppm(const char *path, const unsigned char *rgba, int width, int height) {
     FILE *file = fopen(path, "wb");
@@ -94,6 +104,15 @@ static void fill_texture(unsigned char *pixels, int width, int height) {
     }
 }
 
+static void fill_solid(unsigned char *pixels, int width, int height, int r, int g, int b, int a) {
+    int x, y;
+    for (y = 0; y < height; y++) for (x = 0; x < width; x++) {
+        unsigned char *pixel = pixels + (y * width + x) * 4;
+        pixel[0] = (unsigned char)r; pixel[1] = (unsigned char)g;
+        pixel[2] = (unsigned char)b; pixel[3] = (unsigned char)a;
+    }
+}
+
 int main(void) {
     static GsDraw draws[2];
     static Vtx vertices[3] = {
@@ -101,17 +120,20 @@ int main(void) {
         {520.0f, 140.0f, 0.5f, 80, 230, 110, 255, 1.0f, 0.0f, 1.0f},
         {320.0f, 420.0f, 0.5f, 80, 120, 240, 255, 0.5f, 1.0f, 1.0f}
     };
+    /* The GS uses 0x80 as the neutral colour scale. The ps_3_0 path applies 255/128 once; this probe
+       therefore checks both channel order and the fixed GS brightness convention. */
     static Vtx texturedVertices[3] = {
-        {120.0f, 100.0f, 0.4f, 255, 255, 255, 255, 0.0f, 0.0f, 1.0f},
-        {520.0f, 100.0f, 0.4f, 255, 255, 255, 255, 1.0f, 0.0f, 1.0f},
-        {320.0f, 400.0f, 0.4f, 255, 255, 255, 255, 0.5f, 1.0f, 1.0f}
+        {120.0f, 100.0f, 0.4f, 128, 128, 128, 128, 0.0f, 0.0f, 1.0f},
+        {520.0f, 100.0f, 0.4f, 128, 128, 128, 128, 1.0f, 0.0f, 1.0f},
+        {320.0f, 400.0f, 0.4f, 128, 128, 128, 128, 0.5f, 1.0f, 1.0f}
     };
     unsigned char *readback;
     unsigned char *copyReadback;
     unsigned char *texturePixels;
     unsigned char bc1[8] = {0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-    GsTex gradientTexture, compressedTexture;
+    GsTex gradientTexture, compressedTexture, solidTexture;
     int center, corner;
+    unsigned char *solidPixels;
     if (!sD3d9Backend.init()) {
         return 1;
     }
@@ -160,6 +182,14 @@ int main(void) {
     draws[1].scissor[1] = 0;
     draws[1].scissor[2] = 1024;
     draws[1].scissor[3] = 1024;
+    /* mode[0]=1 (textured from GS memory), mode[1]=0 (TFX MODULATE), mode[2]=1 (TCC: use tex alpha),
+       mode[3]=0 (no alpha test). Matches what gs_draw.c records for a normal textured primitive. */
+    draws[1].mode[0] = 1;
+    draws[1].mode[1] = 0;
+    draws[1].mode[2] = 1;
+    draws[1].mode[3] = 0;
+    /* orig[2]=1.0 means max original alpha = 1.0 (standard non-replacement texture). */
+    draws[1].orig[2] = 1.0f;
     gsVerts = texturedVertices;
     gsDrawCount = 2;
     sD3d9Backend.frameEnd();
@@ -195,6 +225,13 @@ int main(void) {
         return 1;
     }
     free(copyReadback);
+    solidPixels = (unsigned char *)malloc(4 * 4 * 4);
+    if (solidPixels == NULL) return 1;
+    fill_solid(solidPixels, 4, 4, 255, 220, 0, 255);
+    solidTexture = sD3d9Backend.texCreate(4, 4, GS_TEXFMT_RGBA8, 1);
+    if (solidTexture == 0 || !sD3d9Backend.texUpload(solidTexture, 0, 4, 4, GS_TEXFMT_RGBA8, solidPixels, 4 * 4 * 4)) return 1;
+    fprintf(stderr, "D3D9 solid yellow texture uploaded: handle=%p\\n", (void *)(uintptr_t)solidTexture);
+    sD3d9Backend.texDestroy(solidTexture);
     compressedTexture = sD3d9Backend.texCreate(4, 4, GS_TEXFMT_BC1, 1);
     {
         unsigned char *compressedPixels = (unsigned char *)malloc(sizeof(bc1));
@@ -221,7 +258,7 @@ int main(void) {
 }
 '@ | Set-Content -LiteralPath $source -Encoding ASCII
 
-$command = "call `"$vsdev`" -arch=$Architecture -host_arch=x64 >nul && cl /nologo /W4 /WX /D_WIN32 /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$backendSource`" /Fo:`"$backendObject`" && cl /nologo /W4 /WX /D_WIN32 /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$source`" /Fo:`"$probeObject`" && link /DEBUG /PDB:`"$symbols`" /OUT:`"$probe`" `"$backendObject`" `"$probeObject`" d3d9.lib user32.lib gdi32.lib dxguid.lib SDL3.lib /LIBPATH:`"$sdlLib`""
+$command = "call `"$vsdev`" -arch=$Architecture -host_arch=x64 >nul && cl /nologo /W4 /WX /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$backendSource`" /Fo:`"$backendObject`" && cl /nologo /W4 /WX /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$source`" /Fo:`"$probeObject`" && link /DEBUG /PDB:`"$symbols`" /OUT:`"$probe`" `"$backendObject`" `"$probeObject`" d3d9.lib user32.lib gdi32.lib dxguid.lib SDL3.lib /LIBPATH:`"$sdlLib`""
 Write-Output "Probe log: $log"
 $buildOutput = cmd.exe /d /s /c $command 2>&1
 $buildExit = $LASTEXITCODE
