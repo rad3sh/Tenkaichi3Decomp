@@ -1855,7 +1855,17 @@ int GsGpu_Init(void) {
     const char *api = getenv("BT3_GPU_API");
     GsBackend *sb;
 
-    gsScale = getenv("BT3_SCALE") != NULL ? atoi(getenv("BT3_SCALE")) : Port_Setting("scale", 2);
+    /* D3D9 is kept for older GPUs and its render targets are much more expensive than the SDL GPU path. Use
+       native internal resolution by default for that backend; BT3_SCALE or the saved setting still opts into 2x+. */
+    {
+        int defaultScale = 2;
+#ifdef _WIN32
+        if (getenv("BT3_GPU_API") != NULL && strcmp(getenv("BT3_GPU_API"), "d3d9") == 0) {
+            defaultScale = 1;
+        }
+#endif
+        gsScale = getenv("BT3_SCALE") != NULL ? atoi(getenv("BT3_SCALE")) : Port_Setting("scale", defaultScale);
+    }
     gsScale = gsScale < 1 ? 1 : gsScale > 8 ? 8 : gsScale;
     gsPendingScale = 0;
     gsVerts = malloc(MAX_VERTS * sizeof(Vtx));

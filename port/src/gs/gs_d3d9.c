@@ -212,10 +212,16 @@ static D3DFORMAT sAuxFormat = D3DFMT_A8R8G8B8;
 static D3DFORMAT sRgbaTextureFormat = D3DFMT_A8R8G8B8;
 static int sD3d9MrtReady;
 static D3d9Texture *sD3d9AuxCopy;
+static D3d9Texture *sFbTex[2]; /* display-buffer pictures uploaded directly by the movie player */
 static unsigned char sTargetSeen[MAX_TARGETS];
 static int sCurrentTarget = -1;
 static D3d9Vertex *sVuVertices;
 static uint32_t sVuVertexCapacity;
+/* Dynamic stream for ordinary GS/2D draws. DrawPrimitiveUP forces the runtime to copy every draw through a
+   temporary upload path; keeping one persistent dynamic buffer removes that per-draw allocation and copy. */
+static IDirect3DVertexBuffer9 *sGsVb;
+static D3d9Vertex *sGsVertices;
+static uint32_t sGsVertexCapacity;
 static uint32_t sD3d9DrawCount;
 static uint32_t sD3d9VuVertexCount;
 typedef struct D3d9Telemetry {
@@ -242,6 +248,11 @@ static D3d9Telemetry sD3d9Telemetry;
 static uint32_t sD3d9LastTarget = UINT32_MAX;
 static uint32_t sD3d9LastPipeline = UINT32_MAX;
 static uintptr_t sD3d9LastTexture;
+static uintptr_t sD3d9BoundTexture;
+static uint32_t sD3d9AppliedPipeline = UINT32_MAX;
+static float sD3d9AppliedBlendConstant;
+static int sD3d9Scissor[4];
+static int sD3d9ScissorValid;
 
 static uint64_t d3d9_now_ns(void) {
     static LARGE_INTEGER frequency;
@@ -257,6 +268,9 @@ static void d3d9_telemetry_init(void) {
     sD3d9LastTarget = UINT32_MAX;
     sD3d9LastPipeline = UINT32_MAX;
     sD3d9LastTexture = 0;
+    sD3d9AppliedPipeline = UINT32_MAX;
+    sD3d9AppliedBlendConstant = -1.0f;
+    sD3d9ScissorValid = 0;
 }
 
 static void d3d9_telemetry_frame_begin(void) {
@@ -772,6 +786,10 @@ static void d3d9_target_release(D3d9Target *target) {
 static void d3d9_release_all(void) {
     int i;
     d3d9_aux_copy_release();
+    d3d9_texture_release(sFbTex[0]);
+    d3d9_texture_release(sFbTex[1]);
+    sFbTex[0] = NULL;
+    sFbTex[1] = NULL;
     d3d9_vu_shaders_release();
     if (sD3dCompilerDll != NULL) {
         FreeLibrary(sD3dCompilerDll);
@@ -795,6 +813,10 @@ static void d3d9_release_all(void) {
         sBackbuffer->lpVtbl->Release(sBackbuffer);
         sBackbuffer = NULL;
     }
+    if (sGsVb != NULL) {
+        sGsVb->lpVtbl->Release(sGsVb);
+        sGsVb = NULL;
+    }
     if (sDevice != NULL) {
         sDevice->lpVtbl->Release(sDevice);
         sDevice = NULL;
@@ -806,6 +828,9 @@ static void d3d9_release_all(void) {
     free(sVuVertices);
     sVuVertices = NULL;
     sVuVertexCapacity = 0;
+    free(sGsVertices);
+    sGsVertices = NULL;
+    sGsVertexCapacity = 0;
     sTextureCount = 0;
     memset(sTargetSeen, 0, sizeof(sTargetSeen));
     sCurrentTarget = -1;
@@ -880,6 +905,44 @@ static int d3d9_create_device(void) {
 
 static void d3d9_draw_gs(const GsDraw *draw);
 
+static int d3d9_gs_stream_ensure(uint32_t count) {
+    IDirect3DVertexBuffer9 *buffer;
+    D3d9Vertex *vertices;
+    uint32_t capacity = sGsVertexCapacity == 0 ? 4096 : sGsVertexCapacity;
+    HRESULT hr;
+    if (count <= sGsVertexCapacity && sGsVb != NULL) return 1;
+    while (capacity < count) {
+        if (capacity > 1048576 / 2) { capacity = 1048576; break; }
+        capacity *= 2;
+    }
+    vertices = (D3d9Vertex *)malloc((size_t)capacity * sizeof(*sGsVertices));
+    if (vertices == NULL) return 0;
+    hr = sDevice->lpVtbl->CreateVertexBuffer(sDevice, capacity * sizeof(*vertices), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+                                               D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1, D3DPOOL_DEFAULT,
+                                               &buffer, NULL);
+    if (FAILED(hr)) {
+        free(vertices);
+        return 0;
+    }
+    if (sGsVb != NULL) sGsVb->lpVtbl->Release(sGsVb);
+    free(sGsVertices);
+    sGsVertices = vertices;
+    sGsVertexCapacity = capacity;
+    sGsVb = buffer;
+    return 1;
+}
+
+static int d3d9_gs_stream_upload(uint32_t count) {
+    void *dst;
+    HRESULT hr;
+    if (!d3d9_gs_stream_ensure(count)) return 0;
+    hr = sGsVb->lpVtbl->Lock(sGsVb, 0, count * sizeof(*sGsVertices), &dst, D3DLOCK_DISCARD);
+    if (FAILED(hr)) return 0;
+    memcpy(dst, sGsVertices, count * sizeof(*sGsVertices));
+    sGsVb->lpVtbl->Unlock(sGsVb);
+    return 1;
+}
+
 static void d3d9_set_viewport(int width, int height) {
     D3DVIEWPORT9 viewport;
     if (sDevice == NULL || width <= 0 || height <= 0) {
@@ -892,6 +955,12 @@ static void d3d9_set_viewport(int width, int height) {
     viewport.MinZ = 0.0f;
     viewport.MaxZ = 1.0f;
     sDevice->lpVtbl->SetViewport(sDevice, &viewport);
+}
+
+static void d3d9_reset_state_cache(void) {
+    sD3d9AppliedPipeline = UINT32_MAX;
+    sD3d9AppliedBlendConstant = -1.0f;
+    sD3d9ScissorValid = 0;
 }
 
 static void d3d9_bind_backbuffer(void) {
@@ -999,6 +1068,10 @@ static int d3d9_init(void) {
     return 1;
 }
 
+#ifndef D3D9_BACKEND_PROBE
+static int d3d9_fb_upload_texture(int index);
+#endif
+
 static void d3d9_frame_end(void) {
     HRESULT hr;
     uint32_t i;
@@ -1020,6 +1093,10 @@ static void d3d9_frame_end(void) {
     sD3d9LastTarget = UINT32_MAX;
     sD3d9LastPipeline = UINT32_MAX;
     sD3d9LastTexture = 0;
+    sD3d9BoundTexture = UINTPTR_MAX;
+    sD3d9AppliedPipeline = UINT32_MAX;
+    sD3d9AppliedBlendConstant = -1.0f;
+    sD3d9ScissorValid = 0;
     hr = sDevice->lpVtbl->Clear(sDevice, 0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
     if (FAILED(hr)) {
         d3d9_log_hr("Clear", hr);
@@ -1032,6 +1109,17 @@ static void d3d9_frame_end(void) {
     }
     /* Upload VU vertices + indices once per frame into persistent GPU buffers. */
     d3d9_vu_upload_frame();
+#ifndef D3D9_BACKEND_PROBE
+    {
+        extern unsigned gGsFbUploads;
+        for (i = 0; i < 2; i++) {
+            if (gGsFbUploads & (1u << i)) {
+                d3d9_fb_upload_texture((int)i);
+            }
+        }
+        gGsFbUploads = 0;
+    }
+#endif
     for (i = 0; i < gsDrawCount; i++) {
         d3d9_draw_gs(&gsDraws[i]);
     }
@@ -1065,6 +1153,22 @@ static void d3d9_frame_end(void) {
     d3d9_telemetry_log_frame(d3d9_now_ns() - sD3d9Telemetry.frameStartNs);
     sD3d9DrawCount = 0;
     sD3d9VuVertexCount = 0;
+#ifndef D3D9_BACKEND_PROBE
+    /* The shared recorder belongs to the backend contract: every completed frame consumes its list. The SDL GPU
+       backend performs this reset here as well; without it D3D9 replays all previous draws and the frame cost grows
+       continuously during animation and video playback. */
+    for (i = 0; i < (uint32_t)gsTargetCount; i++) {
+        gsTargets[i].draws = 0;
+    }
+    gsVertCount = 0;
+    gsVuVertCount = 0;
+    gsVuIdxCount = 0;
+    gsVuUniCount = 0;
+    gsDrawCount = 0;
+    gsAnchor = 0;
+    gsSkipped = 0;
+    gsNative = 0;
+#endif
 }
 
 static void d3d9_scale_changed(void) {
@@ -1078,6 +1182,9 @@ static void d3d9_scale_changed(void) {
     /* VB/IB are POOL_DEFAULT and must be released before a Reset (targets are rebuilt per-scale). */
     if (sVuVb) { sVuVb->lpVtbl->Release(sVuVb); sVuVb = NULL; sVuVbCapacity = 0; }
     if (sVuIb) { sVuIb->lpVtbl->Release(sVuIb); sVuIb = NULL; sVuIbCapacity = 0; }
+    if (sGsVb) { sGsVb->lpVtbl->Release(sGsVb); sGsVb = NULL; sGsVertexCapacity = 0; }
+    free(sGsVertices);
+    sGsVertices = NULL;
 }
 
 static GsTex d3d9_white_tex(void) { return (GsTex)(uintptr_t)sWhite; }
@@ -1163,6 +1270,50 @@ static int d3d9_tex_upload(GsTex handle, int level, uint32_t width, uint32_t hei
     if (sD3d9Telemetry.enabled) sD3d9Telemetry.uploadNs += d3d9_now_ns() - uploadStart;
     return 1;
 }
+
+#ifndef D3D9_BACKEND_PROBE
+static int d3d9_fb_upload_texture(int index) {
+    D3d9Texture *texture;
+    D3DLOCKED_RECT locked;
+    uint32_t x, y;
+    uint32_t fbp = index ? 0x70u : 0u;
+    uint32_t *pixels;
+    if (index < 0 || index > 1 || sDevice == NULL) {
+        return 0;
+    }
+    texture = sFbTex[index];
+    if (texture == NULL) {
+        texture = (D3d9Texture *)calloc(1, sizeof(*texture));
+        if (texture == NULL || FAILED(sDevice->lpVtbl->CreateTexture(sDevice, GS_W, GS_H, 1, 0, D3DFMT_A8R8G8B8,
+                                                                      D3DPOOL_MANAGED, &texture->texture, NULL)) ||
+            FAILED(texture->texture->lpVtbl->GetSurfaceLevel(texture->texture, 0, &texture->surface))) {
+            if (texture != NULL) {
+                if (texture->surface != NULL) texture->surface->lpVtbl->Release(texture->surface);
+                if (texture->texture != NULL) texture->texture->lpVtbl->Release(texture->texture);
+                free(texture);
+            }
+            return 0;
+        }
+        texture->width = GS_W;
+        texture->height = GS_H;
+        texture->format = GS_TEXFMT_RGBA8;
+        sFbTex[index] = texture;
+    }
+    if (FAILED(texture->texture->lpVtbl->LockRect(texture->texture, 0, &locked, NULL, 0))) {
+        return 0;
+    }
+    pixels = (uint32_t *)locked.pBits;
+    for (y = 0; y < GS_H; y++) {
+        for (x = 0; x < GS_W; x++) {
+            uint32_t c = Gs_VramRead(fbp * 32u, 8, 0, x, y) | 0xFF000000u;
+            pixels[y * (locked.Pitch / 4u) + x] = ((c & 0x000000FFu) << 16) | (c & 0x0000FF00u) |
+                                                  ((c & 0x00FF0000u) >> 16) | (c & 0xFF000000u);
+        }
+    }
+    texture->texture->lpVtbl->UnlockRect(texture->texture, 0);
+    return 1;
+}
+#endif
 
 static void d3d9_tex_destroy(GsTex handle) {
     D3d9Texture *texture = d3d9_texture_from_handle(handle);
@@ -1268,7 +1419,12 @@ static void d3d9_set_target(int index) {
     }
     d3d9_set_viewport((int)sTargets[index].color->width, (int)sTargets[index].color->height);
     if (!sTargetSeen[index]) {
-        sDevice->lpVtbl->ColorFill(sDevice, color, NULL, D3DCOLOR_ARGB(0, 0, 0, 0));
+        HRESULT hr = sDevice->lpVtbl->Clear(sDevice, 0, NULL,
+                                             D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+                                             D3DCOLOR_ARGB(0, 0, 0, 0), 0.0f, 0);
+        if (FAILED(hr)) {
+            d3d9_log_hr("Clear(target/depth)", hr);
+        }
         sTargetSeen[index] = 1;
     }
     if (sD3d9Telemetry.enabled && sD3d9LastTarget != (uint32_t)index) {
@@ -1287,8 +1443,13 @@ static void d3d9_set_scissor(const int *scissor) {
     rect.top = scissor[1];
     rect.right = scissor[0] + scissor[2];
     rect.bottom = scissor[1] + scissor[3];
+    if (sD3d9ScissorValid && memcmp(sD3d9Scissor, scissor, sizeof(sD3d9Scissor)) == 0) {
+        return;
+    }
     sDevice->lpVtbl->SetScissorRect(sDevice, &rect);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
+    memcpy(sD3d9Scissor, scissor, sizeof(sD3d9Scissor));
+    sD3d9ScissorValid = 1;
 }
 
 static D3DBLEND d3d9_gs_c_factor(int blendColor, int inverse) {
@@ -1313,6 +1474,11 @@ static void d3d9_set_blend_constant(float value) {
 
 static void d3d9_apply_pipeline(uint32_t key, float blendConstant) {
     uint32_t bkey = key & 0x3FF;
+    int pipelineChanged = sD3d9AppliedPipeline != key;
+    int blendConstantChanged = sD3d9AppliedBlendConstant != blendConstant;
+    if (!pipelineChanged && !blendConstantChanged) {
+        return;
+    }
     int ztst = (int)((key >> 10) & 3), zwrite = (int)((key >> 12) & 1);
     int wmask = (int)((key >> 16) & 15);
     int enabled = (bkey & 1) != 0;
@@ -1346,6 +1512,8 @@ static void d3d9_apply_pipeline(uint32_t key, float blendConstant) {
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_CULLMODE, D3DCULL_NONE);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_LIGHTING, FALSE);
+    sD3d9AppliedPipeline = key;
+    sD3d9AppliedBlendConstant = blendConstant;
 }
 
 /* ---- CPU-side VU vertex transform helpers -------------------------------------------------- */
@@ -1431,7 +1599,13 @@ static void d3d9_draw_vu_gpu(const GsDraw *draw) {
     d3d9_vu_set_constants(u);
 
     /* Texture + GS pixel shader (or fixed-function fallback when sGsPsReady == 0). */
-    sDevice->lpVtbl->SetTexture(sDevice, 0, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+    {
+        uintptr_t textureHandle = texture != NULL ? (uintptr_t)texture->texture : 0;
+        if (sD3d9BoundTexture != textureHandle) {
+            sDevice->lpVtbl->SetTexture(sDevice, 0, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+            sD3d9BoundTexture = textureHandle;
+        }
+    }
     d3d9_gs_ps_bind(draw);
     if (!sGsPsReady) {
         d3d9_fixed_texture_stage(draw);
@@ -1623,7 +1797,13 @@ static void d3d9_draw_vu(const GsDraw *draw) {
 
     sDevice->lpVtbl->SetFVF(sDevice, D3D9_FVF_TEXTURED);
     sDevice->lpVtbl->SetVertexShader(sDevice, NULL); /* FVF path: no VS */
-    sDevice->lpVtbl->SetTexture(sDevice, 0, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+    {
+        uintptr_t textureHandle = texture != NULL ? (uintptr_t)texture->texture : 0;
+        if (sD3d9BoundTexture != textureHandle) {
+            sDevice->lpVtbl->SetTexture(sDevice, 0, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+            sD3d9BoundTexture = textureHandle;
+        }
+    }
     d3d9_gs_ps_bind(draw);
     if (!sGsPsReady) {
         d3d9_fixed_texture_stage(draw);
@@ -1669,6 +1849,21 @@ static void d3d9_draw_gs(const GsDraw *draw) {
     D3d9Texture *texture = d3d9_texture_from_handle(draw->tex);
     D3d9Vertex *vertices;
     uint32_t count = draw->count;
+    if (draw->native >= 100) {
+        int fb = draw->native - 100;
+        if (fb >= 0 && fb < 2 && sFbTex[fb] != NULL && draw->target >= 0 && draw->target < MAX_TARGETS &&
+            sTargets[draw->target].color != NULL && sTargets[draw->target].color->surface != NULL) {
+            RECT sourceRect = {0, 0, GS_W, GS_H};
+            RECT targetRect = {0, 0, (LONG)sTargets[draw->target].color->width, (LONG)sTargets[draw->target].color->height};
+            d3d9_set_target(draw->target);
+            sDevice->lpVtbl->StretchRect(sDevice, sFbTex[fb]->surface, &sourceRect,
+                                         sTargets[draw->target].color->surface, &targetRect, D3DTEXF_LINEAR);
+#ifndef D3D9_BACKEND_PROBE
+            gsTargets[draw->target].cleared = 1;
+#endif
+        }
+        return;
+    }
     if (draw->native || draw->target < 0 || draw->target >= MAX_TARGETS || count == 0) {
         return;
     }
@@ -1711,9 +1906,25 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         vertices[i].u = source->s;
         vertices[i].v = source->t;
     }
+    if (!d3d9_gs_stream_ensure(count)) {
+        free(vertices);
+        return;
+    }
+    memcpy(sGsVertices, vertices, (size_t)count * sizeof(*vertices));
+    free(vertices);
+    if (!d3d9_gs_stream_upload(count)) {
+        return;
+    }
     sDevice->lpVtbl->SetFVF(sDevice, D3D9_FVF_TEXTURED);
     sDevice->lpVtbl->SetVertexShader(sDevice, NULL); /* FVF path */
-    sDevice->lpVtbl->SetTexture(sDevice, 0, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+    sDevice->lpVtbl->SetStreamSource(sDevice, 0, sGsVb, 0, sizeof(*sGsVertices));
+    {
+        uintptr_t textureHandle = texture != NULL ? (uintptr_t)texture->texture : 0;
+        if (sD3d9BoundTexture != textureHandle) {
+            sDevice->lpVtbl->SetTexture(sDevice, 0, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+            sD3d9BoundTexture = textureHandle;
+        }
+    }
     d3d9_gs_ps_bind(draw);
     if (!sGsPsReady) {
         d3d9_fixed_texture_stage(draw);
@@ -1724,9 +1935,8 @@ static void d3d9_draw_gs(const GsDraw *draw) {
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSU, (draw->sampler & 2) ? D3DTADDRESS_CLAMP : D3DTADDRESS_WRAP);
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSV, (draw->sampler & 4) ? D3DTADDRESS_CLAMP : D3DTADDRESS_WRAP);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
-    sDevice->lpVtbl->DrawPrimitiveUP(sDevice, draw->count == 2 ? D3DPT_LINELIST : D3DPT_TRIANGLELIST,
-                                     draw->count == 2 ? 1 : draw->count / 3, vertices, sizeof(*vertices));
-    free(vertices);
+    sDevice->lpVtbl->DrawPrimitive(sDevice, draw->count == 2 ? D3DPT_LINELIST : D3DPT_TRIANGLELIST,
+                                   0, draw->count == 2 ? 1 : draw->count / 3);
 }
 
 static int d3d9_target_read(int index, uint8_t *rgba) {

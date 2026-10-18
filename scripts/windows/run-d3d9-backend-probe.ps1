@@ -258,7 +258,7 @@ int main(void) {
 }
 '@ | Set-Content -LiteralPath $source -Encoding ASCII
 
-$command = "call `"$vsdev`" -arch=$Architecture -host_arch=x64 >nul && cl /nologo /W4 /WX /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$backendSource`" /Fo:`"$backendObject`" && cl /nologo /W4 /WX /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$source`" /Fo:`"$probeObject`" && link /DEBUG /PDB:`"$symbols`" /OUT:`"$probe`" `"$backendObject`" `"$probeObject`" d3d9.lib user32.lib gdi32.lib dxguid.lib SDL3.lib /LIBPATH:`"$sdlLib`""
+$command = "call `"$vsdev`" -arch=$Architecture -host_arch=x64 >nul && cl /nologo /W4 /WX /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /DD3D9_BACKEND_PROBE /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$backendSource`" /Fo:`"$backendObject`" && cl /nologo /W4 /WX /D_WIN32 /D_CRT_SECURE_NO_WARNINGS /I`"$sdlInclude`" /I`"$Bt3RepoRoot\port\src\gs`" /Zi /FS /c `"$source`" /Fo:`"$probeObject`" && link /DEBUG /PDB:`"$symbols`" /OUT:`"$probe`" `"$backendObject`" `"$probeObject`" d3d9.lib user32.lib gdi32.lib dxguid.lib SDL3.lib /LIBPATH:`"$sdlLib`""
 Write-Output "Probe log: $log"
 $buildOutput = cmd.exe /d /s /c $command 2>&1
 $buildExit = $LASTEXITCODE
