@@ -31,6 +31,10 @@ port/tests/ps2float/*.o
 /play.sh
 install.log
 port/build_release/
+/build/windows/
+/logs/
+*.obj
+*.pdb
 
 # stages and songs from outside the disc that a player drops in next to the game (never committed)
 /stages/
