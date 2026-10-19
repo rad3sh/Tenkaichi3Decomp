@@ -450,6 +450,16 @@ Missing on purpose until their native versions exist, so the GPU picture is brig
 sharper than the reference's: depth tint, glare, the intro's fade, any blur.
 Speed is unchanged (about half real time): see the profile above, not addressed yet.
 
+The D3D9 backend now binds native pass 3 (the depth/alpha CLUT pass) end to end. Its auxiliary
+render target stores the GS alpha byte in R and projected depth in G; native pass 4 snapshots
+that target, and pass 3 samples the snapshot or current depth channel plus the 256-entry CLUT,
+respecting the recorded scissor and pipeline. D3D9 cannot sample its D24S8 surface directly, so
+the fog source uses the normalized depth interpolant captured by the pixel shader; this is an
+approximation, not a bit-exact read of PS2 depth memory. The Windows D3D9 backend probe checks
+both CLUT sources and the scissor boundary. It also checks GS alpha tests at the 0x7F/0x80 edge:
+the D3D9 vertex path keeps RGBAQ alpha raw and applies the GS 255/128 scale once. Other PS2
+memory-view passes remain unsupported.
+
 ## Renderer fixes after the user looked at the window (2026-10-06)
 
 - SMEARS TRAILING BEHIND CAMERA PANS ("a trail of textures"), stage picture stuck on the

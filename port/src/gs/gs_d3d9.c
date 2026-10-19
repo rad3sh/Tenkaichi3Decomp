@@ -49,10 +49,11 @@ typedef struct D3d9Vertex {
     float x, y, z, rhw;
     DWORD color;
     float u, v;
+    float depth;
 } D3d9Vertex;
 
 #define D3D9_FVF_COLOR (D3DFVF_XYZRHW | D3DFVF_DIFFUSE)
-#define D3D9_FVF_TEXTURED (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1)
+#define D3D9_FVF_TEXTURED (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2 | D3DFVF_TEXCOORDSIZE1(1))
 
 /* ---- GPU VU shader path state ---------------------------------------------------------------- */
 
@@ -120,6 +121,7 @@ static uint32_t sVuIbCapacity; /* in indices */
  */
 static IDirect3DPixelShader9 *sGsPs; /* NULL → fixed-function fallback */
 static IDirect3DPixelShader9 *sD3d9OutlinePs;
+static IDirect3DPixelShader9 *sD3d9ClutPs;
 static int sGsPsReady;               /* 1 when sGsPs != NULL and was successfully set */
 
 /* HLSL source for the GS pixel shader (ps_3_0). */
@@ -138,8 +140,9 @@ static const char kGsPsSrc[] =
        the q-divide explicitly: VU VS writes float3; FVF path writes float2 and q = 1 via the vertex's
        u,v (see D3d9Vertex.u, .v). To avoid ambiguity, use a dedicated TC1 for q or simply skip
        the divide and trust that the VU VS has already divided (z = 1). */
-    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; };\n"
-    "float4 main(PS_IN i) : COLOR0 {\n"
+    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; float depth : TEXCOORD1; };\n"
+    "struct PS_OUT { float4 color : COLOR0; float4 aux : COLOR1; };\n"
+    "PS_OUT main(PS_IN i) {\n"
     /* GS alpha scale k = 255/128 ≈ 1.9922; carried through vColor.a * k. */
     "    float k = 255.0 / 128.0;\n"
     "    float3 rgb = i.col.rgb;\n"
@@ -179,17 +182,40 @@ static const char kGsPsSrc[] =
     "        else if (f == 2) killv = ref - ag - 0.001;\n"   /* pass when ag < ref  */
     "        else if (f == 3) killv = ref - ag + 0.001;\n"   /* pass when ag <= ref */
     "        else if (f == 4) killv = 0.5 - abs(ag - ref);\n" /* pass when |ag-ref|<0.5 */
-    "        else if (f == 5) killv = ag - ref - 0.001;\n"   /* pass when ag >= ref */
-    "        else if (f == 6) killv = ag - ref + 0.001;\n"   /* pass when ag > ref  */
+    "        else if (f == 5) killv = ag - ref + 0.001;\n" /* pass when ag >= ref */
+    "        else if (f == 6) killv = ag - ref - 0.001;\n" /* pass when ag > ref  */
     "        else             killv = abs(ag - ref) - 0.5;\n" /* pass when |ag-ref|>=0.5 */
     "        clip(killv);\n"
     "    }\n"
     /* extra.y != 0: pre-multiply colour by alpha (GS As/0x80 blending above 0x80). */
     "    if (psExtra.y != 0.0) rgb *= a;\n"
-    "    float4 out0;\n"
-    "    out0.rgb = clamp(rgb, 0.0, 1.0);\n"
-    "    out0.a   = clamp(a,   0.0, 1.0);\n"
+    "    PS_OUT out0;\n"
+    "    out0.color.rgb = clamp(rgb, 0.0, 1.0);\n"
+    "    out0.color.a   = clamp(a,   0.0, 1.0);\n"
+    "    out0.aux = float4(clamp(a * 128.0 / 255.0, 0.0, 1.0), saturate(i.depth), 0.0, 1.0);\n"
     "    return out0;\n"
+    "}\n";
+
+static const char kD3d9ClutPsSrc[] =
+    "sampler2D srcTex : register(s0);\n"
+    "sampler2D clutTex : register(s1);\n"
+    "float4 params : register(c0);\n"
+    "struct PS_IN { float2 uv : TEXCOORD0; };\n"
+    "struct PS_OUT { float4 color : COLOR0; float4 aux : COLOR1; };\n"
+    "PS_OUT main(PS_IN i) {\n"
+    "    float4 src = tex2D(srcTex, i.uv);\n"
+    "    float index;\n"
+    "    if (params.x < 0.5) {\n"
+    "        float z = src.g * params.y;\n"
+    "        index = z >= 65448.0 ? 0.0 : clamp(255.0 - floor(z / 256.0), 0.0, 255.0);\n"
+    "    } else {\n"
+    "        index = floor(src.r * 255.0 + 0.5);\n"
+    "    }\n"
+    "    float4 c = tex2D(clutTex, float2((index + 0.5) / 256.0, 0.5));\n"
+    "    PS_OUT o;\n"
+    "    o.color = float4(c.rgb, saturate(c.a * (255.0 / 128.0)));\n"
+    "    o.aux = float4(c.a, 0.0, 0.0, 1.0);\n"
+    "    return o;\n"
     "}\n";
 
 /* ----------------------------------------------------------------------------------------------- */
@@ -212,6 +238,7 @@ static D3DFORMAT sAuxFormat = D3DFMT_A8R8G8B8;
 static D3DFORMAT sRgbaTextureFormat = D3DFMT_A8R8G8B8;
 static int sD3d9MrtReady;
 static D3d9Texture *sD3d9AuxCopy;
+static int sD3d9AuxCopyTarget = -1;
 static D3d9Texture *sFbTex[2]; /* display-buffer pictures uploaded directly by the movie player */
 static unsigned char sTargetSeen[MAX_TARGETS];
 static int sCurrentTarget = -1;
@@ -351,7 +378,7 @@ static const char kVu0HlslSrc[] =
     "float4 light2 : register(c18);\n"
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inNormal : NORMAL; float4 inSt : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; };\n"
+    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; };\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
     "    float miscW = misc.w;\n"
@@ -362,6 +389,7 @@ static const char kVu0HlslSrc[] =
     "    if (miscW == 2.0 && s.w < 0.0) s = -s;\n"
     "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
     "    if (miscW == 2.0) o.pos.z = clamp(s.z / abs(misc.z), 0.0, 1.0) * s.w;\n"
+    "    o.depth = saturate(o.pos.z / o.pos.w);\n"
     "    float4 cr; float2 uv;\n"
     "    if (miscW == 5.0) {\n"
     "        float4 n1 = float4(i.inNormal.xyz, 1.0);\n"
@@ -399,11 +427,12 @@ static const char kVu4HlslSrc[] =
     "float4 light2 : register(c18);\n"
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inColor : NORMAL; float4 inSt : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; };\n"
+    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; };\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
     "    float4 s = mul(screen, i.inPos);\n"
     "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
+    "    o.depth = saturate(o.pos.z / o.pos.w);\n"
     "    o.col = saturate(floor(i.inColor) / 255.0);\n"
     "    o.stq = float3(i.inSt.xy, 1.0);\n"
     "    return o;\n"
@@ -423,7 +452,7 @@ static const char kVu6HlslSrc[] =
     "float4 light2 : register(c18);\n"
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inColor : NORMAL; float4 unused : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; };\n"
+    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; };\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
     "    float4 p  = float4(i.inPos.xyz, 1.0);\n"
@@ -431,6 +460,7 @@ static const char kVu6HlslSrc[] =
     "    float4 c  = mul(shadowCam, p);\n"
     "    float2 st = (c.xy * scale.x + 1.0) * 0.5 * texScale.xy;\n"
     "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
+    "    o.depth = saturate(o.pos.z / o.pos.w);\n"
     "    o.col = saturate(floor(i.inColor) / 255.0);\n"
     "    o.stq = float3(st, 1.0);\n"
     "    return o;\n"
@@ -542,12 +572,17 @@ static void d3d9_gs_ps_init(void) {
         return;
     }
     sGsPsReady = 1;
+    sD3d9ClutPs = d3d9_compile_ps(kD3d9ClutPsSrc, "gs_clut_ps");
+    if (sD3d9ClutPs == NULL) {
+        fprintf(stderr, "bt3: d3d9: native CLUT pass unavailable\n");
+    }
     fprintf(stderr, "bt3: d3d9: GS pixel shader ready (ps_3_0)\n");
 }
 
 static void d3d9_gs_ps_release(void) {
     if (sGsPs) { sGsPs->lpVtbl->Release(sGsPs); sGsPs = NULL; }
     if (sD3d9OutlinePs) { sD3d9OutlinePs->lpVtbl->Release(sD3d9OutlinePs); sD3d9OutlinePs = NULL; }
+    if (sD3d9ClutPs) { sD3d9ClutPs->lpVtbl->Release(sD3d9ClutPs); sD3d9ClutPs = NULL; }
     sGsPsReady = 0;
 }
 
@@ -772,6 +807,66 @@ static void d3d9_aux_copy_release(void) {
         d3d9_texture_release(sD3d9AuxCopy);
         sD3d9AuxCopy = NULL;
     }
+    sD3d9AuxCopyTarget = -1;
+}
+
+static int d3d9_aux_copy_ensure(uint32_t width, uint32_t height) {
+    D3d9Texture *copy;
+    HRESULT hr;
+    if (sD3d9AuxCopy != NULL && sD3d9AuxCopy->width == width && sD3d9AuxCopy->height == height) {
+        return 1;
+    }
+    d3d9_aux_copy_release();
+    copy = (D3d9Texture *)calloc(1, sizeof(*copy));
+    if (copy == NULL) {
+        fprintf(stderr, "bt3: d3d9: unable to allocate auxiliary snapshot\n");
+        return 0;
+    }
+    hr = sDevice->lpVtbl->CreateTexture(sDevice, width, height, 1, D3DUSAGE_RENDERTARGET,
+                                         sAuxFormat, D3DPOOL_DEFAULT, &copy->texture, NULL);
+    if (FAILED(hr)) {
+        d3d9_log_hr("CreateTexture(aux snapshot)", hr);
+        free(copy);
+        return 0;
+    }
+    hr = copy->texture->lpVtbl->GetSurfaceLevel(copy->texture, 0, &copy->surface);
+    if (FAILED(hr)) {
+        d3d9_log_hr("GetSurfaceLevel(aux snapshot)", hr);
+        d3d9_texture_release(copy);
+        return 0;
+    }
+    copy->width = width;
+    copy->height = height;
+    copy->renderTarget = 1;
+    sD3d9AuxCopy = copy;
+    return 1;
+}
+
+static int d3d9_aux_snapshot(int targetIndex) {
+    D3d9Target *target;
+    HRESULT hr;
+    if (targetIndex < 0 || targetIndex >= MAX_TARGETS || sDevice == NULL) {
+        return 0;
+    }
+    target = &sTargets[targetIndex];
+    if (target->aux == NULL || target->aux->surface == NULL ||
+        !d3d9_aux_copy_ensure(target->aux->width, target->aux->height)) {
+        return 0;
+    }
+    hr = sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
+    if (FAILED(hr)) {
+        d3d9_log_hr("SetRenderTarget(aux snapshot unbind)", hr);
+        return 0;
+    }
+    hr = sDevice->lpVtbl->StretchRect(sDevice, target->aux->surface, NULL,
+                                      sD3d9AuxCopy->surface, NULL, D3DTEXF_NONE);
+    if (FAILED(hr)) {
+        d3d9_log_hr("StretchRect(aux snapshot)", hr);
+        sD3d9AuxCopyTarget = -1;
+        return 0;
+    }
+    sD3d9AuxCopyTarget = targetIndex;
+    return 1;
 }
 
 static void d3d9_target_release(D3d9Target *target) {
@@ -873,10 +968,14 @@ static int d3d9_create_device(void) {
         fprintf(stderr, "bt3: D3D9 adapter: %s, driver %s\n", adapter.Description, adapter.Driver);
     }
     if (sD3d->lpVtbl->GetDeviceCaps(sD3d, D3DADAPTER_DEFAULT, type, &caps) == D3D_OK) {
+        sD3d9MrtReady = caps.NumSimultaneousRTs >= 2;
         fprintf(stderr, "bt3: D3D9 caps: shader vs_%d_%d ps_%d_%d max_texture %lu\n",
                 D3DSHADER_VERSION_MAJOR(caps.VertexShaderVersion), D3DSHADER_VERSION_MINOR(caps.VertexShaderVersion),
                 D3DSHADER_VERSION_MAJOR(caps.PixelShaderVersion), D3DSHADER_VERSION_MINOR(caps.PixelShaderVersion),
                 (unsigned long)(caps.MaxTextureWidth < caps.MaxTextureHeight ? caps.MaxTextureWidth : caps.MaxTextureHeight));
+        if (!sD3d9MrtReady) {
+            fprintf(stderr, "bt3: d3d9: native CLUT pass unavailable (requires two render targets)\n");
+        }
     }
     hr = sD3d->lpVtbl->CreateDevice(sD3d, D3DADAPTER_DEFAULT, type, (HWND)hwnd, behavior, &sPresent, &sDevice);
     if (FAILED(hr)) {
@@ -920,7 +1019,7 @@ static int d3d9_gs_stream_ensure(uint32_t count) {
     vertices = (D3d9Vertex *)malloc((size_t)capacity * sizeof(*sGsVertices));
     if (vertices == NULL) return 0;
     hr = sDevice->lpVtbl->CreateVertexBuffer(sDevice, capacity * sizeof(*vertices), D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
-                                               D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1, D3DPOOL_DEFAULT,
+                                               D3D9_FVF_TEXTURED, D3DPOOL_DEFAULT,
                                                &buffer, NULL);
     if (FAILED(hr)) {
         free(vertices);
@@ -1178,6 +1277,7 @@ static void d3d9_scale_changed(void) {
     if (sDevice == NULL) {
         return;
     }
+    d3d9_aux_copy_release();
     for (i = 0; i < MAX_TARGETS; i++) {
         d3d9_target_release(&sTargets[i]);
     }
@@ -1383,6 +1483,9 @@ static void d3d9_target_ensure(int index) {
 
 static void d3d9_target_drop(int index) {
     if (index >= 0 && index < MAX_TARGETS) {
+        if (sD3d9AuxCopyTarget == index) {
+            sD3d9AuxCopyTarget = -1;
+        }
         d3d9_target_release(&sTargets[index]);
     }
 }
@@ -1418,6 +1521,11 @@ static void d3d9_set_target(int index) {
     }
     if (depth != NULL) {
         sDevice->lpVtbl->SetDepthStencilSurface(sDevice, depth);
+    }
+    if (sD3d9MrtReady && sTargets[index].aux != NULL && sTargets[index].aux->surface != NULL) {
+        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, sTargets[index].aux->surface);
+    } else {
+        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
     }
     d3d9_set_viewport((int)sTargets[index].color->width, (int)sTargets[index].color->height);
     if (!sTargetSeen[index]) {
@@ -1511,6 +1619,11 @@ static void d3d9_apply_pipeline(uint32_t key, float blendConstant) {
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZFUNC, ztst == 1 ? D3DCMP_ALWAYS : ztst == 2 ? D3DCMP_GREATEREQUAL : D3DCMP_GREATER);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZWRITEENABLE, zwrite != 0);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE, wmask & 15);
+    if (sD3d9MrtReady) {
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE1,
+                                         D3DCOLORWRITEENABLE_GREEN |
+                                         ((wmask & GS_CC_A) ? D3DCOLORWRITEENABLE_RED : 0));
+    }
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_CULLMODE, D3DCULL_NONE);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_LIGHTING, FALSE);
@@ -1791,6 +1904,7 @@ static void d3d9_draw_vu(const GsDraw *draw) {
             (int)(cb * 255.0f + 0.5f));
         vertices[i].u = us;
         vertices[i].v = ut;
+        vertices[i].depth = vertices[i].z;
     }
 
     d3d9_set_target(draw->target);
@@ -1833,6 +1947,73 @@ static void d3d9_draw_vu(const GsDraw *draw) {
     }
 }
 
+static void d3d9_draw_native3(const GsDraw *draw) {
+    D3d9Target *target;
+    D3d9Texture *clut;
+    D3d9Vertex vertices[4];
+    float params[4] = {(float)draw->src, draw->misc[0], 0.0f, 0.0f};
+    uint32_t pipelineKey;
+    DWORD auxWriteMask;
+    float width, height;
+
+    if (draw->target < 0 || draw->target >= MAX_TARGETS || sD3d9ClutPs == NULL ||
+        !sD3d9MrtReady || sTargets[draw->target].color == NULL ||
+        sTargets[draw->target].aux == NULL || sTargets[draw->target].color->surface == NULL) {
+        return;
+    }
+    target = &sTargets[draw->target];
+    clut = d3d9_texture_from_handle(draw->tex);
+    if (clut == NULL || clut->texture == NULL) {
+        fprintf(stderr, "bt3: d3d9: native CLUT pass has no lookup texture\n");
+        return;
+    }
+    if ((draw->src == 0 || sD3d9AuxCopyTarget != draw->target) &&
+        !d3d9_aux_snapshot(draw->target)) {
+        return;
+    }
+    d3d9_set_target(draw->target);
+    pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
+    d3d9_apply_pipeline(pipelineKey, draw->blendc);
+    d3d9_set_scissor(draw->scissor);
+
+    auxWriteMask = ((pipelineKey >> 16) & GS_CC_A) ? D3DCOLORWRITEENABLE_RED : 0;
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE1, auxWriteMask);
+    sDevice->lpVtbl->SetPixelShader(sDevice, sD3d9ClutPs);
+    sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 0, params, 1);
+    sDevice->lpVtbl->SetVertexShader(sDevice, NULL);
+    sDevice->lpVtbl->SetFVF(sDevice, D3D9_FVF_TEXTURED);
+    sDevice->lpVtbl->SetTexture(sDevice, 0, (IDirect3DBaseTexture9 *)sD3d9AuxCopy->texture);
+    sD3d9BoundTexture = (uintptr_t)sD3d9AuxCopy->texture;
+    sDevice->lpVtbl->SetTexture(sDevice, 1, (IDirect3DBaseTexture9 *)clut->texture);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+
+    width = (float)target->color->width;
+    height = (float)target->color->height;
+    memset(vertices, 0, sizeof(vertices));
+    vertices[0].x = -0.5f; vertices[0].y = -0.5f; vertices[0].rhw = 1.0f;
+    vertices[1].x = width - 0.5f; vertices[1].y = -0.5f; vertices[1].rhw = 1.0f;
+    vertices[2].x = -0.5f; vertices[2].y = height - 0.5f; vertices[2].rhw = 1.0f;
+    vertices[3].x = width - 0.5f; vertices[3].y = height - 0.5f; vertices[3].rhw = 1.0f;
+    vertices[0].color = vertices[1].color = vertices[2].color = vertices[3].color = 0xFFFFFFFFu;
+    vertices[0].u = 0.0f; vertices[0].v = 0.0f;
+    vertices[1].u = 1.0f; vertices[1].v = 0.0f;
+    vertices[2].u = 0.0f; vertices[2].v = 1.0f;
+    vertices[3].u = 1.0f; vertices[3].v = 1.0f;
+    sDevice->lpVtbl->DrawPrimitiveUP(sDevice, D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
+
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE1,
+                                     D3DCOLORWRITEENABLE_GREEN |
+                                     (((pipelineKey >> 16) & GS_CC_A) ? D3DCOLORWRITEENABLE_RED : 0));
+    sD3d9AppliedPipeline = UINT32_MAX;
+}
+
 static void d3d9_draw_gs(const GsDraw *draw) {
     uint32_t i;
     if (sD3d9Telemetry.enabled) {
@@ -1866,6 +2047,14 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         }
         return;
     }
+    if (draw->native == 4) {
+        d3d9_aux_snapshot(draw->target);
+        return;
+    }
+    if (draw->native == 3) {
+        d3d9_draw_native3(draw);
+        return;
+    }
     if (draw->native || draw->target < 0 || draw->target >= MAX_TARGETS || count == 0) {
         return;
     }
@@ -1889,14 +2078,11 @@ static void d3d9_draw_gs(const GsDraw *draw) {
     }
     for (i = 0; i < count; i++) {
         const Vtx *source = &gsVerts[draw->first + i];
-        /* GS alpha: 0x80 = opaque (k = 255/128).  Pass the raw [0..128] value scaled to [0..255]
-           so the GS pixel shader can apply its own k multiply (a * k in PS).  When the PS is not
-           available we clamp the old way. */
+        /* GS alpha is the raw RGBAQ byte; the pixel shader applies the 255/128 GS scale once.
+           The fixed-function fallback still needs the legacy conversion to ordinary D3D alpha. */
         int av;
         if (sGsPsReady) {
-            /* Deliver a / 128 into the 0..1 D3D vertex colour alpha so that PS sees vColor.a = a/128. */
-            av = (int)(source->a * 2);      /* a/128 * 255 ≈ a * 1.992; close enough, PS multiplies by k */
-            if (av > 255) av = 255;
+            av = source->a;
         } else {
             av = source->a > 127 ? 255 : source->a * 2; /* legacy: clamp to 255 at 0x80 */
         }
@@ -1907,6 +2093,7 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         vertices[i].color = D3DCOLOR_ARGB(av, source->r, source->g, source->b);
         vertices[i].u = source->s;
         vertices[i].v = source->t;
+        vertices[i].depth = source->z;
     }
     if (!d3d9_gs_stream_ensure(count)) {
         free(vertices);

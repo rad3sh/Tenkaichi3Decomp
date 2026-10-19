@@ -114,7 +114,7 @@ static void fill_solid(unsigned char *pixels, int width, int height, int r, int 
 }
 
 int main(void) {
-    static GsDraw draws[2];
+    static GsDraw draws[4];
     static Vtx vertices[3] = {
         {120.0f, 120.0f, 0.5f, 255, 80, 80, 255, 0.0f, 0.0f, 1.0f},
         {520.0f, 140.0f, 0.5f, 80, 230, 110, 255, 1.0f, 0.0f, 1.0f},
@@ -127,13 +127,40 @@ int main(void) {
         {520.0f, 100.0f, 0.4f, 128, 128, 128, 128, 1.0f, 0.0f, 1.0f},
         {320.0f, 400.0f, 0.4f, 128, 128, 128, 128, 0.5f, 1.0f, 1.0f}
     };
+    static Vtx clutSourceVertices[3] = {
+        {120.0f, 100.0f, 0.4f, 128, 128, 128, 128, 0.0f, 0.0f, 1.0f},
+        {520.0f, 100.0f, 0.4f, 128, 128, 128, 128, 1.0f, 0.0f, 1.0f},
+        {320.0f, 400.0f, 0.4f, 128, 128, 128, 128, 0.5f, 1.0f, 1.0f}
+    };
+    static Vtx alphaTestVertices[18] = {
+        {20.0f, 20.0f, 0.5f, 255, 0, 0, 127, 0.0f, 0.0f, 1.0f},
+        {130.0f, 20.0f, 0.5f, 255, 0, 0, 127, 0.0f, 0.0f, 1.0f},
+        {75.0f, 200.0f, 0.5f, 255, 0, 0, 127, 0.0f, 0.0f, 1.0f},
+        {140.0f, 20.0f, 0.5f, 255, 0, 0, 128, 0.0f, 0.0f, 1.0f},
+        {250.0f, 20.0f, 0.5f, 255, 0, 0, 128, 0.0f, 0.0f, 1.0f},
+        {195.0f, 200.0f, 0.5f, 255, 0, 0, 128, 0.0f, 0.0f, 1.0f},
+        {260.0f, 20.0f, 0.5f, 255, 0, 0, 128, 0.0f, 0.0f, 1.0f},
+        {370.0f, 20.0f, 0.5f, 255, 0, 0, 128, 0.0f, 0.0f, 1.0f},
+        {315.0f, 200.0f, 0.5f, 255, 0, 0, 128, 0.0f, 0.0f, 1.0f},
+        {380.0f, 20.0f, 0.5f, 255, 0, 0, 129, 0.0f, 0.0f, 1.0f},
+        {490.0f, 20.0f, 0.5f, 255, 0, 0, 129, 0.0f, 0.0f, 1.0f},
+        {435.0f, 200.0f, 0.5f, 255, 0, 0, 129, 0.0f, 0.0f, 1.0f},
+        {20.0f, 220.0f, 0.5f, 128, 128, 128, 128, 0.25f, 0.5f, 1.0f},
+        {250.0f, 220.0f, 0.5f, 128, 128, 128, 128, 0.25f, 0.5f, 1.0f},
+        {135.0f, 420.0f, 0.5f, 128, 128, 128, 128, 0.25f, 0.5f, 1.0f},
+        {260.0f, 220.0f, 0.5f, 128, 128, 128, 128, 0.75f, 0.5f, 1.0f},
+        {490.0f, 220.0f, 0.5f, 128, 128, 128, 128, 0.75f, 0.5f, 1.0f},
+        {375.0f, 420.0f, 0.5f, 128, 128, 128, 128, 0.75f, 0.5f, 1.0f}
+    };
     unsigned char *readback;
     unsigned char *copyReadback;
     unsigned char *texturePixels;
     unsigned char bc1[8] = {0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     GsTex gradientTexture, compressedTexture, solidTexture;
+    GsTex clutTexture, alphaTexture;
     int center, corner;
     unsigned char *solidPixels;
+    unsigned char *clutPixels;
     if (!sD3d9Backend.init()) {
         return 1;
     }
@@ -225,6 +252,169 @@ int main(void) {
         return 1;
     }
     free(copyReadback);
+    clutPixels = (unsigned char *)calloc(256, 4);
+    if (clutPixels == NULL) {
+        free(readback);
+        return 1;
+    }
+    clutPixels[0 * 4 + 0] = 20;
+    clutPixels[0 * 4 + 1] = 220;
+    clutPixels[0 * 4 + 2] = 40;
+    clutPixels[0 * 4 + 3] = 128;
+    clutPixels[128 * 4 + 0] = 230;
+    clutPixels[128 * 4 + 1] = 20;
+    clutPixels[128 * 4 + 2] = 40;
+    clutPixels[128 * 4 + 3] = 128;
+    clutTexture = sD3d9Backend.texCreate(256, 1, GS_TEXFMT_RGBA8, 1);
+    if (clutTexture == 0) {
+        free(clutPixels);
+        free(readback);
+        return 1;
+    }
+    if (!sD3d9Backend.texUpload(clutTexture, 0, 256, 1, GS_TEXFMT_RGBA8, clutPixels, 256 * 4)) {
+        sD3d9Backend.texDestroy(clutTexture);
+        free(readback);
+        return 1;
+    }
+    memset(&draws[0], 0, sizeof(draws[0]));
+    draws[0].first = 0;
+    draws[0].count = 3;
+    draws[0].target = 0;
+    draws[0].pipeline = sD3d9Backend.pipeGet((1u << 10) | (1u << 12) | (15u << 16));
+    draws[0].tex = sD3d9Backend.whiteTex();
+    draws[0].scissor[2] = 1024;
+    draws[0].scissor[3] = 1024;
+    memset(&draws[1], 0, sizeof(draws[1]));
+    draws[1].native = 4;
+    draws[1].target = 0;
+    memset(&draws[2], 0, sizeof(draws[2]));
+    draws[2].native = 3;
+    draws[2].src = 1;
+    draws[2].target = 0;
+    draws[2].tex = clutTexture;
+    draws[2].misc[0] = 16777215.0f;
+    draws[2].pipeline = sD3d9Backend.pipeGet((15u << 16) | (1u << 22));
+    draws[2].scissor[0] = 256;
+    draws[2].scissor[1] = 256;
+    draws[2].scissor[2] = 512;
+    draws[2].scissor[3] = 512;
+    draws[3] = draws[2];
+    draws[3].src = 0;
+    gsVerts = clutSourceVertices;
+    gsDrawCount = 3;
+    sD3d9Backend.frameEnd();
+    if (!sD3d9Backend.targetRead(0, readback)) {
+        free(readback);
+        return 1;
+    }
+    center = (320 * 512 + 320) * 4;
+    if (!pixel_matches(readback, 320, 320, 230, 20, 40) ||
+        !near_byte(readback[corner], 0) || !near_byte(readback[corner + 1], 0) || !near_byte(readback[corner + 2], 0)) {
+        fprintf(stderr, "D3D9 alpha-CLUT assertion failed: center=%u,%u,%u\n",
+                readback[center], readback[center + 1], readback[center + 2]);
+        free(readback);
+        return 1;
+    }
+    draws[0] = draws[3];
+    gsDrawCount = 1;
+    sD3d9Backend.frameEnd();
+    if (!sD3d9Backend.targetRead(0, readback)) {
+        free(readback);
+        return 1;
+    }
+    if (!pixel_matches(readback, 320, 320, 20, 220, 40) ||
+        !near_byte(readback[corner], 0) || !near_byte(readback[corner + 1], 0) || !near_byte(readback[corner + 2], 0)) {
+        fprintf(stderr, "D3D9 depth-CLUT assertion failed: center=%u,%u,%u\n",
+                readback[center], readback[center + 1], readback[center + 2]);
+        free(readback);
+        return 1;
+    }
+    sD3d9Backend.texDestroy(clutTexture);
+    {
+        unsigned char *alphaPixels = (unsigned char *)malloc(2 * 4);
+        unsigned char *alphaReadback = (unsigned char *)malloc(512 * 448 * 4);
+        int baselineAt = (270 * 512 + 135) * 4;
+        unsigned char textureBaseline[3];
+        if (alphaPixels == NULL || alphaReadback == NULL) {
+            free(alphaPixels);
+            free(alphaReadback);
+            free(readback);
+            return 1;
+        }
+        alphaPixels[0] = 255; alphaPixels[1] = 255; alphaPixels[2] = 255; alphaPixels[3] = 127;
+        alphaPixels[4] = 255; alphaPixels[5] = 255; alphaPixels[6] = 255; alphaPixels[7] = 128;
+        alphaTexture = sD3d9Backend.texCreate(2, 1, GS_TEXFMT_RGBA8, 1);
+        if (alphaTexture == 0) {
+            free(alphaPixels);
+            free(alphaReadback);
+            free(readback);
+            return 1;
+        }
+        if (!sD3d9Backend.texUpload(alphaTexture, 0, 2, 1, GS_TEXFMT_RGBA8, alphaPixels, 2 * 4)) {
+            sD3d9Backend.texDestroy(alphaTexture);
+            free(alphaPixels);
+            free(alphaReadback);
+            free(readback);
+            return 1;
+        }
+        if (!sD3d9Backend.targetRead(1, alphaReadback)) {
+            sD3d9Backend.texDestroy(alphaTexture);
+            free(alphaReadback);
+            free(readback);
+            return 1;
+        }
+        textureBaseline[0] = alphaReadback[baselineAt];
+        textureBaseline[1] = alphaReadback[baselineAt + 1];
+        textureBaseline[2] = alphaReadback[baselineAt + 2];
+        sD3d9Backend.targetEnsure(1);
+        memset(&draws[0], 0, sizeof(draws[0]));
+        draws[0].count = 6;
+        draws[0].target = 1;
+        draws[0].pipeline = sD3d9Backend.pipeGet((1u << 10) | (1u << 12) | (15u << 16));
+        draws[0].tex = sD3d9Backend.whiteTex();
+        draws[0].scissor[2] = 1024;
+        draws[0].scissor[3] = 1024;
+        draws[0].mode[3] = 6;
+        draws[0].misc[0] = 128.0f;
+        draws[1] = draws[0];
+        draws[1].first = 6;
+        draws[1].mode[3] = 7;
+        memset(&draws[2], 0, sizeof(draws[2]));
+        draws[2].first = 12;
+        draws[2].count = 6;
+        draws[2].target = 1;
+        draws[2].pipeline = draws[0].pipeline;
+        draws[2].tex = alphaTexture;
+        draws[2].scissor[2] = 1024;
+        draws[2].scissor[3] = 1024;
+        draws[2].mode[0] = 1;
+        draws[2].mode[2] = 1;
+        draws[2].mode[3] = 6;
+        draws[2].misc[0] = 128.0f;
+        gsVerts = alphaTestVertices;
+        gsDrawCount = 3;
+        sD3d9Backend.frameEnd();
+        if (!sD3d9Backend.targetRead(1, alphaReadback)) {
+            sD3d9Backend.texDestroy(alphaTexture);
+            free(alphaReadback);
+            free(readback);
+            return 1;
+        }
+        if (!pixel_matches(alphaReadback, 75, 80, 0, 0, 0) ||
+            !pixel_matches(alphaReadback, 195, 80, 255, 0, 0) ||
+            !pixel_matches(alphaReadback, 315, 80, 0, 0, 0) ||
+            !pixel_matches(alphaReadback, 435, 80, 255, 0, 0) ||
+            !pixel_matches(alphaReadback, 135, 270, textureBaseline[0], textureBaseline[1], textureBaseline[2]) ||
+            !pixel_matches(alphaReadback, 375, 270, 255, 255, 255)) {
+            fprintf(stderr, "D3D9 GS alpha-test assertion failed\n");
+            sD3d9Backend.texDestroy(alphaTexture);
+            free(alphaReadback);
+            free(readback);
+            return 1;
+        }
+        sD3d9Backend.texDestroy(alphaTexture);
+        free(alphaReadback);
+    }
     solidPixels = (unsigned char *)malloc(4 * 4 * 4);
     if (solidPixels == NULL) return 1;
     fill_solid(solidPixels, 4, 4, 255, 220, 0, 255);
