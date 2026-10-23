@@ -17,6 +17,7 @@
 #include <d3d9.h>
 #include <d3dcommon.h>   /* ID3DBlob, D3D_SHADER_MACRO, ID3DInclude (needed for D3DCompile signature) */
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,8 +87,10 @@ static PFN_D3DCompile sD3dCompileFn;
 
 /* The three VS programs (NULL if compilation failed → CPU fallback). */
 static IDirect3DVertexShader9 *sVuShader[3]; /* [0]=vu0, [1]=vu4, [2]=vu6 */
+static IDirect3DVertexShader9 *sVu4DepthShader;
 static IDirect3DVertexDeclaration9 *sVuDecl;
 static int sVuShaderReady; /* 1 if all three shaders + declaration are valid */
+static int sD3d9PixelDepthEnabled;
 
 /* Persistent GPU vertex buffer for gsVuVerts (re-created if capacity grows). */
 static IDirect3DVertexBuffer9 *sVuVb;
@@ -108,18 +111,15 @@ static uint32_t sVuIbCapacity; /* in indices */
  *                z=FBA (1 = set alpha bit 7), w=2D-pixel-scale (0 = sample per fragment)
  *   c2  rect  : uv clamp region for frame-buffer-as-texture (u0,v0,u1,v1)
  *   c3  orig  : xy=original texture size, z=largest original alpha, w=smooth-2D flag
- *   c4  extra : x=unused(depth, not written here), y=blendc (pre-multiply flag), z=0, w=0
+ *   c4  extra : x=depth maximum, y=blendc (pre-multiply flag), z=0, w=0
  *
  * Limitations vs gs.frag:
- *   - No gl_FragDepth write: SM3 ps_3_0 can write DEPTH but we skip it for performance;
- *     depth is handled entirely by D3D9's fixed-function depth test (z from VS output).
- *   - dateTex (destination-alpha test) is not supported: D3D9 lacks the equivalent
- *     of texelFetch() on a copy-before-draw; misc.y is always 0 in practice.
  *   - 2D sub-pixel snap (misc.w != 0 paths) is approximated as plain uv pass-through;
  *     the GS-pixel-grid clamping is preserved via rect when mode.x==2.
  *   - mode.x==3 (texture pack replacements) is treated identically to mode.x==1.
  */
 static IDirect3DPixelShader9 *sGsPs; /* NULL → fixed-function fallback */
+static IDirect3DPixelShader9 *sGsPsDepth;
 static IDirect3DPixelShader9 *sD3d9OutlinePs;
 static IDirect3DPixelShader9 *sD3d9ClutPs;
 static int sGsPsReady;               /* 1 when sGsPs != NULL and was successfully set */
@@ -132,17 +132,27 @@ static const char kGsPsSrc[] =
     "float4 psRect  : register(c2);\n"  /* u0,v0,u1,v1 */
     "float4 psOrig  : register(c3);\n"  /* xy=origSz, z=maxAlpha, w=smooth */
     "float4 psExtra : register(c4);\n"  /* y=blendc (extra.y != 0 → premultiply alpha) */
+    "float4 psTarget : register(c5);\n" /* xy=target size, zw=reciprocal size */
     /* Sampler */
     "sampler2D tex : register(s0);\n"
-    /* Input from VS.  Both VU-GPU (which sets stq.z = 1 in the VS) and the FVF non-VU path (which sends
-       float2 UV with stq.z implicitly 1) share the same struct.  D3D9 zero-extends missing components,
-       so stq.z defaults to 0 when only float2 is emitted.  We therefore always set TEXCOORD1 to carry
-       the q-divide explicitly: VU VS writes float3; FVF path writes float2 and q = 1 via the vertex's
-       u,v (see D3d9Vertex.u, .v). To avoid ambiguity, use a dedicated TC1 for q or simply skip
-       the divide and trust that the VU VS has already divided (z = 1). */
-    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; float depth : TEXCOORD1; };\n"
+    "sampler2D dateTex : register(s1);\n"
+    /* Default path receives depth on TEXCOORD1. The experimental WRITE_DEPTH path uses TEXCOORD2
+       for clip-space z/w so the pixel shader can reproduce the interpolated depth. */
+    "#ifdef WRITE_DEPTH\n"
+    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; float2 depthZW : TEXCOORD2; float2 pos : VPOS; };\n"
+    "struct PS_OUT { float4 color : COLOR0; float4 aux : COLOR1; float depth : DEPTH; };\n"
+    "#define GS_DEPTH saturate(i.depthZW.x / max(i.depthZW.y, 1.0e-20))\n"
+    "#else\n"
+    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; float depth : TEXCOORD1; float2 pos : VPOS; };\n"
     "struct PS_OUT { float4 color : COLOR0; float4 aux : COLOR1; };\n"
+    "#define GS_DEPTH saturate(i.depth)\n"
+    "#endif\n"
     "PS_OUT main(PS_IN i) {\n"
+    "    if (psMisc.y != 0.0) {\n"
+    "        float stored = tex2D(dateTex, i.pos * psTarget.zw).r;\n"
+    "        bool set = stored >= (127.5 / 255.0);\n"
+    "        if (set != (psMisc.y > 1.5)) clip(-1.0);\n"
+    "    }\n"
     /* GS alpha scale k = 255/128 ≈ 1.9922; carried through vColor.a * k. */
     "    float k = 255.0 / 128.0;\n"
     "    float3 rgb = i.col.rgb;\n"
@@ -192,7 +202,15 @@ static const char kGsPsSrc[] =
     "    PS_OUT out0;\n"
     "    out0.color.rgb = clamp(rgb, 0.0, 1.0);\n"
     "    out0.color.a   = clamp(a,   0.0, 1.0);\n"
-    "    out0.aux = float4(clamp(a * 128.0 / 255.0, 0.0, 1.0), saturate(i.depth), 0.0, 1.0);\n"
+    "    out0.aux = float4(clamp(a * 128.0 / 255.0, 0.0, 1.0), GS_DEPTH, 0.0, 1.0);\n"
+    "#ifdef WRITE_DEPTH\n"
+    "    float depth = GS_DEPTH;\n"
+    "    if (psExtra.x > 0.0 && psExtra.x < 2.0e7) {\n"
+    "        float zn = floor(depth * psExtra.x), zq = zn / psExtra.x;\n"
+    "        depth = zq > depth ? (zn - 1.0) / psExtra.x : zq;\n"
+    "    }\n"
+    "    out0.depth = depth;\n"
+    "#endif\n"
     "    return out0;\n"
     "}\n";
 
@@ -236,11 +254,15 @@ static uint32_t sPipeKeys[1024];
    StretchRect on D3D9 drivers that reject A8 source/destination pairs. Its alpha byte is still the GS mask. */
 static D3DFORMAT sAuxFormat = D3DFMT_A8R8G8B8;
 static D3DFORMAT sRgbaTextureFormat = D3DFMT_A8R8G8B8;
+static D3DFORMAT sDepthFormat = D3DFMT_D24S8;
 static int sD3d9MrtReady;
 static D3d9Texture *sD3d9AuxCopy;
+static D3d9Texture *sD3d9DateCopy;
 static int sD3d9AuxCopyTarget = -1;
 static D3d9Texture *sFbTex[2]; /* display-buffer pictures uploaded directly by the movie player */
+#ifdef D3D9_BACKEND_PROBE
 static unsigned char sTargetSeen[MAX_TARGETS];
+#endif
 static int sCurrentTarget = -1;
 static D3d9Vertex *sVuVertices;
 static uint32_t sVuVertexCapacity;
@@ -256,10 +278,16 @@ typedef struct D3d9Telemetry {
     uint32_t frame;
     uint32_t draws;
     uint32_t vuDraws;
+    uint32_t vu4Draws;
     uint32_t draw2d;
     uint32_t nativeDraws;
+    uint32_t native3Draws;
+    uint32_t native4Draws;
+    uint32_t dateSnapshots;
+    uint32_t dateDraws;
     uint64_t vertices;
     uint64_t indices;
+    uint64_t vu4Indices;
     uint32_t targetChanges;
     uint32_t textureChanges;
     uint32_t pipelineChanges;
@@ -276,10 +304,27 @@ static uint32_t sD3d9LastTarget = UINT32_MAX;
 static uint32_t sD3d9LastPipeline = UINT32_MAX;
 static uintptr_t sD3d9LastTexture;
 static uintptr_t sD3d9BoundTexture;
+static uintptr_t sD3d9BoundTexture1;
 static uint32_t sD3d9AppliedPipeline = UINT32_MAX;
 static float sD3d9AppliedBlendConstant;
 static int sD3d9Scissor[4];
 static int sD3d9ScissorValid;
+
+static int d3d9_target_is_cleared(int index) {
+#ifdef D3D9_BACKEND_PROBE
+    return sTargetSeen[index] != 0;
+#else
+    return gsTargets[index].cleared;
+#endif
+}
+
+static void d3d9_target_set_cleared(int index, int cleared) {
+#ifdef D3D9_BACKEND_PROBE
+    sTargetSeen[index] = (unsigned char)(cleared != 0);
+#else
+    gsTargets[index].cleared = cleared;
+#endif
+}
 
 static uint64_t d3d9_now_ns(void) {
     static LARGE_INTEGER frequency;
@@ -290,8 +335,10 @@ static uint64_t d3d9_now_ns(void) {
 }
 
 static void d3d9_telemetry_init(void) {
+    const char *vu4Trace = getenv("BT3_D3D9_VU4_TRACE");
     memset(&sD3d9Telemetry, 0, sizeof(sD3d9Telemetry));
-    sD3d9Telemetry.enabled = getenv("BT3_D3D9_TELEMETRY") != NULL && atoi(getenv("BT3_D3D9_TELEMETRY")) != 0;
+    sD3d9Telemetry.enabled = (getenv("BT3_D3D9_TELEMETRY") != NULL && atoi(getenv("BT3_D3D9_TELEMETRY")) != 0) ||
+                             (vu4Trace != NULL && atoi(vu4Trace) != 0);
     sD3d9LastTarget = UINT32_MAX;
     sD3d9LastPipeline = UINT32_MAX;
     sD3d9LastTexture = 0;
@@ -307,21 +354,27 @@ static void d3d9_telemetry_frame_begin(void) {
         sD3d9Telemetry.frameSubmitStartNs = sD3d9Telemetry.frameStartNs;
     }
 }
-
 static void d3d9_telemetry_log_frame(uint64_t frameNs) {
     if (!sD3d9Telemetry.enabled) return;
     if (frameNs > 16670000ull) sD3d9Telemetry.frames16++;
     if (frameNs > 33330000ull) sD3d9Telemetry.frames33++;
-    fprintf(stderr, "d3d9-telemetry: frame=%u draws=%u vu_draws=%u draws_2d=%u native=%u vertices=%llu indices=%llu targets=%u textures=%u pipelines=%u upload_ms=%.3f submit_ms=%.3f present_ms=%.3f frame_ms=%.3f over16=%u over33=%u\n",
-            sD3d9Telemetry.frame, sD3d9Telemetry.draws, sD3d9Telemetry.vuDraws, sD3d9Telemetry.draw2d,
-            sD3d9Telemetry.nativeDraws, (unsigned long long)sD3d9Telemetry.vertices,
+    fprintf(stderr, "d3d9-telemetry: frame=%u draws=%u vu_draws=%u vu4_draws=%u vu4_indices=%llu draws_2d=%u native=%u native3=%u native4=%u date_snapshots=%u date_draws=%u vertices=%llu indices=%llu targets=%u textures=%u pipelines=%u upload_ms=%.3f submit_ms=%.3f present_ms=%.3f frame_ms=%.3f over16=%u over33=%u\n",
+            sD3d9Telemetry.frame, sD3d9Telemetry.draws, sD3d9Telemetry.vuDraws,
+            sD3d9Telemetry.vu4Draws, (unsigned long long)sD3d9Telemetry.vu4Indices, sD3d9Telemetry.draw2d,
+            sD3d9Telemetry.nativeDraws, sD3d9Telemetry.native3Draws, sD3d9Telemetry.native4Draws,
+            sD3d9Telemetry.dateSnapshots, sD3d9Telemetry.dateDraws,
+            (unsigned long long)sD3d9Telemetry.vertices,
             (unsigned long long)sD3d9Telemetry.indices, sD3d9Telemetry.targetChanges,
             sD3d9Telemetry.textureChanges, sD3d9Telemetry.pipelineChanges,
             sD3d9Telemetry.uploadNs / 1000000.0, sD3d9Telemetry.submitNs / 1000000.0,
             sD3d9Telemetry.presentNs / 1000000.0, frameNs / 1000000.0,
             sD3d9Telemetry.frames16, sD3d9Telemetry.frames33);
-    sD3d9Telemetry.draws = sD3d9Telemetry.vuDraws = sD3d9Telemetry.draw2d = sD3d9Telemetry.nativeDraws = 0;
+    sD3d9Telemetry.draws = sD3d9Telemetry.vuDraws = sD3d9Telemetry.vu4Draws = 0;
+    sD3d9Telemetry.draw2d = sD3d9Telemetry.nativeDraws = 0;
+    sD3d9Telemetry.native3Draws = sD3d9Telemetry.native4Draws = 0;
+    sD3d9Telemetry.dateSnapshots = sD3d9Telemetry.dateDraws = 0;
     sD3d9Telemetry.vertices = sD3d9Telemetry.indices = 0;
+    sD3d9Telemetry.vu4Indices = 0;
     sD3d9Telemetry.targetChanges = sD3d9Telemetry.textureChanges = sD3d9Telemetry.pipelineChanges = 0;
     sD3d9Telemetry.uploadNs = sD3d9Telemetry.submitNs = sD3d9Telemetry.presentNs = 0;
 }
@@ -353,15 +406,25 @@ static void d3d9_log_hr(const char *what, HRESULT hr) {
  */
 
 /* Helper macro: the common screen-space formula used by all three programs.
-   Returns clip-space (px,py,pz,pw) from post-transform (sx,sy,sz,sw) and misc (offx,offy,depthMax). */
+   Returns clip-space (px,py,pz,pw) from post-transform (sx,sy,sz,sw) and misc (offx,offy,depthMax).
+   Depth-clamp emulation: D3D9 always clips primitives at the near plane (w <= 0), while the OpenGL
+   back end keeps them with glEnable(GL_DEPTH_CLAMP) and the SDL GPU one has depth clipping off by
+   default. Stage triangles that cross the near plane (the ground under a low camera) therefore
+   vanished there and came and went with the camera's movement. A vertex behind the eye is given a
+   small positive w instead (GL clamps its NDC depth to 0) so the primitive is kept and rasterised
+   across the screen where it crosses, limited by the scissor, as the other back ends' depth clamp
+   does. */
 #define D3D9_VU_PROJ_HLSL \
     "float4 vu_proj(float sx, float sy, float sz, float sw, float offx, float offy, float depthMax) {\n" \
-    "    float nx = (sx - offx * sw) / 512.0 - sw;\n" \
-    "    float ny = sw - (sy - offy * sw) / 512.0;\n" \
+    "    float w = sw;\n" \
+    "    float useW = w > 0.0 ? w : 1.0e-4;\n" \
+    "    float nx = (sx - offx * useW) / 512.0 - useW;\n" \
+    "    float ny = useW - (sy - offy * useW) / 512.0;\n" \
     "    float nd;\n" \
-    "    if (sw > 0.0 && depthMax > 0.0) { nd = (floor(sz / sw) + 0.5) / depthMax * sw; nd = clamp(nd, 0.0, sw); }\n" \
-    "    else { nd = clamp(sz / abs(depthMax), 0.0, 1.0) * sw; }\n" \
-    "    return float4(nx, ny, nd, sw);\n" \
+    "    if (w <= 0.0) { nd = 0.0; }\n" \
+    "    else if (depthMax > 0.0) { nd = (floor(sz / useW) + 0.5) / depthMax * useW; nd = clamp(nd, 0.0, useW); }\n" \
+    "    else { nd = clamp(sz / abs(depthMax), 0.0, 1.0) * useW; }\n" \
+    "    return float4(nx, ny, nd, useW);\n" \
     "}\n"
 
 static const char kVu0HlslSrc[] =
@@ -427,12 +490,19 @@ static const char kVu4HlslSrc[] =
     "float4 light2 : register(c18);\n"
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inColor : NORMAL; float4 inSt : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; };\n"
+    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1;\n"
+    "#ifdef WRITE_DEPTH\n"
+    "    float2 depthZW : TEXCOORD2;\n"
+    "#endif\n"
+    "};\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
     "    float4 s = mul(screen, i.inPos);\n"
     "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
     "    o.depth = saturate(o.pos.z / o.pos.w);\n"
+    "#ifdef WRITE_DEPTH\n"
+    "    o.depthZW = float2(o.pos.z, o.pos.w);\n"
+    "#endif\n"
     "    o.col = saturate(floor(i.inColor) / 255.0);\n"
     "    o.stq = float3(i.inSt.xy, 1.0);\n"
     "    return o;\n"
@@ -489,12 +559,18 @@ static int d3d9_load_compiler(void) {
     return 0;
 }
 
-static IDirect3DVertexShader9 *d3d9_compile_vs(const char *src, const char *name) {
+static const D3D_SHADER_MACRO kD3d9WriteDepthDefine[] = {
+    {"WRITE_DEPTH", "1"},
+    {NULL, NULL}
+};
+
+static IDirect3DVertexShader9 *d3d9_compile_vs_variant(const char *src, const char *name,
+                                                       const D3D_SHADER_MACRO *defines) {
     ID3DBlob *code = NULL, *errors = NULL;
     IDirect3DVertexShader9 *vs = NULL;
     HRESULT hr;
     if (sD3dCompileFn == NULL) return NULL;
-    hr = sD3dCompileFn(src, strlen(src), name, NULL, NULL, "main", "vs_3_0",
+    hr = sD3dCompileFn(src, strlen(src), name, defines, NULL, "main", "vs_3_0",
                        (1u << 15) /* D3DCOMPILE_OPTIMIZATION_LEVEL3 */, 0, &code, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "bt3: d3d9: VS compile %s failed (0x%08lX)", name, (unsigned long)hr);
@@ -512,14 +588,19 @@ static IDirect3DVertexShader9 *d3d9_compile_vs(const char *src, const char *name
     return vs;
 }
 
+static IDirect3DVertexShader9 *d3d9_compile_vs(const char *src, const char *name) {
+    return d3d9_compile_vs_variant(src, name, NULL);
+}
+
 /* ---- GS pixel shader init / release --------------------------------------------------------- */
 
-static IDirect3DPixelShader9 *d3d9_compile_ps(const char *src, const char *name) {
+static IDirect3DPixelShader9 *d3d9_compile_ps_variant(const char *src, const char *name,
+                                                       const D3D_SHADER_MACRO *defines) {
     ID3DBlob *code = NULL, *errors = NULL;
     IDirect3DPixelShader9 *ps = NULL;
     HRESULT hr;
     if (!d3d9_load_compiler()) return NULL;
-    hr = sD3dCompileFn(src, strlen(src), name, NULL, NULL, "main", "ps_3_0", (1u << 15), 0, &code, &errors);
+    hr = sD3dCompileFn(src, strlen(src), name, defines, NULL, "main", "ps_3_0", (1u << 15), 0, &code, &errors);
     if (FAILED(hr)) {
         if (errors) { fprintf(stderr, "bt3: d3d9: PS compile %s: %s\n", name, (const char *)errors->lpVtbl->GetBufferPointer(errors)); errors->lpVtbl->Release(errors); }
         return NULL;
@@ -528,6 +609,10 @@ static IDirect3DPixelShader9 *d3d9_compile_ps(const char *src, const char *name)
     hr = sDevice->lpVtbl->CreatePixelShader(sDevice, (const DWORD *)code->lpVtbl->GetBufferPointer(code), &ps);
     code->lpVtbl->Release(code);
     return FAILED(hr) ? NULL : ps;
+}
+
+static IDirect3DPixelShader9 *d3d9_compile_ps(const char *src, const char *name) {
+    return d3d9_compile_ps_variant(src, name, NULL);
 }
 
 static const char kD3d9OutlinePsSrc[] =
@@ -572,6 +657,19 @@ static void d3d9_gs_ps_init(void) {
         return;
     }
     sGsPsReady = 1;
+    if (getenv("BT3_D3D9_PIXEL_DEPTH") != NULL && atoi(getenv("BT3_D3D9_PIXEL_DEPTH")) != 0) {
+        if (sVu4DepthShader != NULL) {
+            sGsPsDepth = d3d9_compile_ps_variant(kGsPsSrc, "gs_ps_depth", kD3d9WriteDepthDefine);
+            if (sGsPsDepth != NULL) {
+                sD3d9PixelDepthEnabled = 1;
+                fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth enabled (BT3_D3D9_PIXEL_DEPTH=1)\n");
+            } else {
+                fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth shader unavailable; using interpolated depth\n");
+            }
+        } else {
+            fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth vertex shader unavailable; using interpolated depth\n");
+        }
+    }
     sD3d9ClutPs = d3d9_compile_ps(kD3d9ClutPsSrc, "gs_clut_ps");
     if (sD3d9ClutPs == NULL) {
         fprintf(stderr, "bt3: d3d9: native CLUT pass unavailable\n");
@@ -581,9 +679,11 @@ static void d3d9_gs_ps_init(void) {
 
 static void d3d9_gs_ps_release(void) {
     if (sGsPs) { sGsPs->lpVtbl->Release(sGsPs); sGsPs = NULL; }
+    if (sGsPsDepth) { sGsPsDepth->lpVtbl->Release(sGsPsDepth); sGsPsDepth = NULL; }
     if (sD3d9OutlinePs) { sD3d9OutlinePs->lpVtbl->Release(sD3d9OutlinePs); sD3d9OutlinePs = NULL; }
     if (sD3d9ClutPs) { sD3d9ClutPs->lpVtbl->Release(sD3d9ClutPs); sD3d9ClutPs = NULL; }
     sGsPsReady = 0;
+    sD3d9PixelDepthEnabled = 0;
 }
 
 /* Load PS constants from a GsDraw.  PS constant layout (float4):
@@ -591,9 +691,9 @@ static void d3d9_gs_ps_release(void) {
      c1 misc: x=AREF, y=dest-alpha-test, z=FBA, w=2D-scale
      c2 rect: u0,v0,u1,v1
      c3 orig: xy=origSz, z=maxAlpha, w=smooth
-     c4 extra: x=0, y=blendc (extra.y in GLSL), z=0, w=0 */
+     c4 extra: x=depth maximum, y=blendc (extra.y in GLSL), z=0, w=0 */
 static void d3d9_gs_ps_set_constants(const GsDraw *draw) {
-    float c0[4], c4[4];
+    float c0[4], c4[4], c5[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     c0[0] = (float)draw->mode[0];
     c0[1] = (float)draw->mode[1];
@@ -604,21 +704,49 @@ static void d3d9_gs_ps_set_constants(const GsDraw *draw) {
     c4[1] = (pipelineKey & (1u << 9)) != 0 ? 1.0f : 0.0f; /* extra.y: GS source-alpha premultiply flag */
     c4[2] = 0.0f;
     c4[3] = 0.0f;
+    if (draw->target >= 0 && draw->target < MAX_TARGETS && sTargets[draw->target].color != NULL) {
+        c5[0] = (float)sTargets[draw->target].color->width;
+        c5[1] = (float)sTargets[draw->target].color->height;
+        c5[2] = 1.0f / c5[0];
+        c5[3] = 1.0f / c5[1];
+    }
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 0, c0,         1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 1, draw->misc, 1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 2, draw->rect, 1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 3, draw->orig, 1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 4, c4,         1);
+    sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 5, c5,         1);
+}
+
+static void d3d9_bind_texture1(D3d9Texture *texture) {
+    uintptr_t handle = texture != NULL ? (uintptr_t)texture->texture : 0;
+    if (sD3d9BoundTexture1 != handle) {
+        sDevice->lpVtbl->SetTexture(sDevice, 1, texture != NULL ? (IDirect3DBaseTexture9 *)texture->texture : NULL);
+        sD3d9BoundTexture1 = handle;
+    }
 }
 
 /* Bind (or unbind) the GS pixel shader.  When sGsPsReady == 0, NULL is set to restore fixed-function. */
 static void d3d9_gs_ps_bind(const GsDraw *draw) {
+    IDirect3DPixelShader9 *pixelShader = sGsPs;
+    uint32_t pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     if (!sGsPsReady || sGsPs == NULL) {
         sDevice->lpVtbl->SetPixelShader(sDevice, NULL);
         return;
     }
-    sDevice->lpVtbl->SetPixelShader(sDevice, sGsPs);
+    if (sD3d9PixelDepthEnabled && draw->vu == 2 && (pipelineKey & (1u << 23)) == 0 &&
+        sGsPsDepth != NULL) {
+        pixelShader = sGsPsDepth;
+    }
+    sDevice->lpVtbl->SetPixelShader(sDevice, pixelShader);
     d3d9_gs_ps_set_constants(draw);
+    d3d9_bind_texture1(draw->misc[1] != 0.0f ? sD3d9DateCopy : NULL);
+    if (draw->misc[1] != 0.0f) {
+        sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        sDevice->lpVtbl->SetSamplerState(sDevice, 1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    }
 }
 
 /* Fixed-function fallback keeps vertex and texture alpha in GS units. MODULATE4X converts
@@ -689,6 +817,9 @@ static void d3d9_vu_shaders_init(void) {
         fprintf(stderr, "bt3: d3d9: VU shader init failed; falling back to CPU transforms\n");
         return;
     }
+    if (getenv("BT3_D3D9_PIXEL_DEPTH") != NULL && atoi(getenv("BT3_D3D9_PIXEL_DEPTH")) != 0) {
+        sVu4DepthShader = d3d9_compile_vs_variant(kVu4HlslSrc, "vu4_pixel_depth", kD3d9WriteDepthDefine);
+    }
     sVuDecl = d3d9_make_vu_decl();
     if (sVuDecl == NULL) return;
     sVuShaderReady = 1;
@@ -703,6 +834,7 @@ static void d3d9_vu_shaders_release(void) {
     for (i = 0; i < 3; i++) {
         if (sVuShader[i]) { sVuShader[i]->lpVtbl->Release(sVuShader[i]); sVuShader[i] = NULL; }
     }
+    if (sVu4DepthShader) { sVu4DepthShader->lpVtbl->Release(sVu4DepthShader); sVu4DepthShader = NULL; }
     if (sVuDecl)  { sVuDecl->lpVtbl->Release(sVuDecl);   sVuDecl  = NULL; }
     if (sVuVb)    { sVuVb->lpVtbl->Release(sVuVb);       sVuVb    = NULL; sVuVbCapacity = 0; }
     if (sVuIb)    { sVuIb->lpVtbl->Release(sVuIb);       sVuIb    = NULL; sVuIbCapacity = 0; }
@@ -802,47 +934,50 @@ static void d3d9_texture_release(D3d9Texture *texture) {
     free(texture);
 }
 
+static void d3d9_snapshot_release(D3d9Texture **snapshot) {
+    d3d9_texture_release(*snapshot);
+    *snapshot = NULL;
+}
+
 static void d3d9_aux_copy_release(void) {
-    if (sD3d9AuxCopy != NULL) {
-        d3d9_texture_release(sD3d9AuxCopy);
-        sD3d9AuxCopy = NULL;
-    }
+    d3d9_snapshot_release(&sD3d9AuxCopy);
+    d3d9_snapshot_release(&sD3d9DateCopy);
     sD3d9AuxCopyTarget = -1;
 }
 
-static int d3d9_aux_copy_ensure(uint32_t width, uint32_t height) {
+static int d3d9_snapshot_ensure(D3d9Texture **snapshot, uint32_t width, uint32_t height, const char *name) {
     D3d9Texture *copy;
     HRESULT hr;
-    if (sD3d9AuxCopy != NULL && sD3d9AuxCopy->width == width && sD3d9AuxCopy->height == height) {
+    if (*snapshot != NULL && (*snapshot)->width == width && (*snapshot)->height == height) {
         return 1;
     }
-    d3d9_aux_copy_release();
+    d3d9_snapshot_release(snapshot);
     copy = (D3d9Texture *)calloc(1, sizeof(*copy));
     if (copy == NULL) {
-        fprintf(stderr, "bt3: d3d9: unable to allocate auxiliary snapshot\n");
+        fprintf(stderr, "bt3: d3d9: unable to allocate %s snapshot\n", name);
         return 0;
     }
     hr = sDevice->lpVtbl->CreateTexture(sDevice, width, height, 1, D3DUSAGE_RENDERTARGET,
                                          sAuxFormat, D3DPOOL_DEFAULT, &copy->texture, NULL);
     if (FAILED(hr)) {
-        d3d9_log_hr("CreateTexture(aux snapshot)", hr);
+        d3d9_log_hr("CreateTexture(snapshot)", hr);
         free(copy);
         return 0;
     }
     hr = copy->texture->lpVtbl->GetSurfaceLevel(copy->texture, 0, &copy->surface);
     if (FAILED(hr)) {
-        d3d9_log_hr("GetSurfaceLevel(aux snapshot)", hr);
+        d3d9_log_hr("GetSurfaceLevel(snapshot)", hr);
         d3d9_texture_release(copy);
         return 0;
     }
     copy->width = width;
     copy->height = height;
     copy->renderTarget = 1;
-    sD3d9AuxCopy = copy;
+    *snapshot = copy;
     return 1;
 }
 
-static int d3d9_aux_snapshot(int targetIndex) {
+static int d3d9_aux_snapshot_to(int targetIndex, D3d9Texture **snapshot, const char *name) {
     D3d9Target *target;
     HRESULT hr;
     if (targetIndex < 0 || targetIndex >= MAX_TARGETS || sDevice == NULL) {
@@ -850,23 +985,34 @@ static int d3d9_aux_snapshot(int targetIndex) {
     }
     target = &sTargets[targetIndex];
     if (target->aux == NULL || target->aux->surface == NULL ||
-        !d3d9_aux_copy_ensure(target->aux->width, target->aux->height)) {
+        !d3d9_snapshot_ensure(snapshot, target->aux->width, target->aux->height, name)) {
         return 0;
     }
     hr = sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
     if (FAILED(hr)) {
-        d3d9_log_hr("SetRenderTarget(aux snapshot unbind)", hr);
+        d3d9_log_hr("SetRenderTarget(snapshot unbind)", hr);
         return 0;
     }
     hr = sDevice->lpVtbl->StretchRect(sDevice, target->aux->surface, NULL,
-                                      sD3d9AuxCopy->surface, NULL, D3DTEXF_NONE);
+                                      (*snapshot)->surface, NULL, D3DTEXF_NONE);
     if (FAILED(hr)) {
-        d3d9_log_hr("StretchRect(aux snapshot)", hr);
+        d3d9_log_hr("StretchRect(snapshot)", hr);
+        return 0;
+    }
+    return 1;
+}
+
+static int d3d9_aux_snapshot(int targetIndex) {
+    if (!d3d9_aux_snapshot_to(targetIndex, &sD3d9AuxCopy, "auxiliary")) {
         sD3d9AuxCopyTarget = -1;
         return 0;
     }
     sD3d9AuxCopyTarget = targetIndex;
     return 1;
+}
+
+static int d3d9_date_snapshot(int targetIndex) {
+    return d3d9_aux_snapshot_to(targetIndex, &sD3d9DateCopy, "DATE");
 }
 
 static void d3d9_target_release(D3d9Target *target) {
@@ -929,7 +1075,9 @@ static void d3d9_release_all(void) {
     sGsVertices = NULL;
     sGsVertexCapacity = 0;
     sTextureCount = 0;
+#ifdef D3D9_BACKEND_PROBE
     memset(sTargetSeen, 0, sizeof(sTargetSeen));
+#endif
     sCurrentTarget = -1;
 }
 
@@ -977,6 +1125,12 @@ static int d3d9_create_device(void) {
             fprintf(stderr, "bt3: d3d9: native CLUT pass unavailable (requires two render targets)\n");
         }
     }
+    if (sD3d->lpVtbl->CheckDeviceFormat(sD3d, D3DADAPTER_DEFAULT, type, sPresent.BackBufferFormat,
+                                        D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, D3DFMT_D32) == D3D_OK &&
+        sD3d->lpVtbl->CheckDepthStencilMatch(sD3d, D3DADAPTER_DEFAULT, type, sPresent.BackBufferFormat,
+                                              D3DFMT_A8R8G8B8, D3DFMT_D32) == D3D_OK) {
+        sDepthFormat = D3DFMT_D32;
+    }
     hr = sD3d->lpVtbl->CreateDevice(sD3d, D3DADAPTER_DEFAULT, type, (HWND)hwnd, behavior, &sPresent, &sDevice);
     if (FAILED(hr)) {
         behavior = D3DCREATE_SOFTWARE_VERTEXPROCESSING;
@@ -998,6 +1152,8 @@ static int d3d9_create_device(void) {
         sRgbaTextureFormat = D3DFMT_X8R8G8B8;
         fprintf(stderr, "bt3: D3D9: using X8R8G8B8 for RGB textures\n");
     }
+    fprintf(stderr, "bt3: D3D9 depth target format %s\n",
+            sDepthFormat == D3DFMT_D32 ? "D32" : "D24S8");
     fprintf(stderr, "bt3: D3D9 auxiliary target format A8R8G8B8 (alpha snapshots enabled)\n");
     fprintf(stderr, "bt3: D3D9 device ready (%s vertex processing)\n",
             behavior == D3DCREATE_HARDWARE_VERTEXPROCESSING ? "hardware" : "software");
@@ -1005,6 +1161,7 @@ static int d3d9_create_device(void) {
 }
 
 static void d3d9_draw_gs(const GsDraw *draw);
+static int d3d9_target_read(int index, uint8_t *rgba);
 
 static int d3d9_gs_stream_ensure(uint32_t count) {
     IDirect3DVertexBuffer9 *buffer;
@@ -1080,8 +1237,18 @@ static void d3d9_present_target(void) {
     IDirect3DSurface9 *source;
     RECT sourceRect, destRect;
     HRESULT hr;
-    int width, height, presentWidth, presentHeight, offsetX, offsetY;
+    int width, height, presentWidth, presentHeight, offsetX, offsetY, i;
     int presentTarget = sCurrentTarget;
+#ifndef D3D9_BACKEND_PROBE
+    presentTarget = gGsMainFbp >= 0 ? GsDraw_TargetGet((uint32_t)gGsMainFbp, 0) : -1;
+    for (i = 0; presentTarget < 0 && i < gsTargetCount; i++) {
+        if (d3d9_target_is_cleared(i) && sTargets[i].color != NULL && sTargets[i].color->surface != NULL) {
+            presentTarget = i;
+        }
+    }
+#else
+    (void)i;
+#endif
     if (presentTarget < 0 || presentTarget >= MAX_TARGETS || sTargets[presentTarget].color == NULL ||
         sTargets[presentTarget].color->surface == NULL || sBackbuffer == NULL) {
         return;
@@ -1195,6 +1362,7 @@ static void d3d9_frame_end(void) {
     sD3d9LastPipeline = UINT32_MAX;
     sD3d9LastTexture = 0;
     sD3d9BoundTexture = UINTPTR_MAX;
+    sD3d9BoundTexture1 = UINTPTR_MAX;
     sD3d9AppliedPipeline = UINT32_MAX;
     sD3d9AppliedBlendConstant = -1.0f;
     sD3d9ScissorValid = 0;
@@ -1239,6 +1407,42 @@ static void d3d9_frame_end(void) {
         uint64_t presentStart = d3d9_now_ns();
         hr = sDevice->lpVtbl->Present(sDevice, NULL, NULL, NULL, NULL);
         if (sD3d9Telemetry.enabled) sD3d9Telemetry.presentNs = d3d9_now_ns() - presentStart;
+    }
+    /* BT3_SHOT=<n>: every n frames, write the shown buffer's picture (512 x 448 RGBA) as a PPM, as the
+       OpenGL and SDL GPU back ends do (port/build/shots/gpu_NNNNN.ppm). */
+    {
+        static int every = -1;
+        if (every < 0) { every = getenv("BT3_SHOT") != NULL ? atoi(getenv("BT3_SHOT")) : 0; }
+        if (every > 0) {
+            int shotTarget = gGsMainFbp >= 0 ? GsDraw_TargetGet((uint32_t)gGsMainFbp, 0) : -1;
+            for (i = 0; shotTarget < 0 && i < gsTargetCount; i++) {
+                if (gsTargets[i].cleared) { shotTarget = i; }
+            }
+            if (shotTarget >= 0 && shotTarget < MAX_TARGETS && gsTargets[shotTarget].cleared &&
+                (int)gGsFrame % every == 0 &&
+                (getenv("BT3_SHOT_FROM") == NULL || (int)gGsFrame >= atoi(getenv("BT3_SHOT_FROM"))) &&
+                (getenv("BT3_SHOT_TO") == NULL || (int)gGsFrame <= atoi(getenv("BT3_SHOT_TO")))) {
+                uint8_t *px = malloc(512 * 448 * 4);
+                if (px != NULL && d3d9_target_read(shotTarget, px)) {
+                    int y;
+                    uint32_t x;
+                    char name[64];
+                    FILE *fp;
+                    snprintf(name, sizeof(name), "shots/gpu_%05u.ppm", gGsFrame);
+                    fp = fopen(name, "wb");
+                    if (fp != NULL) {
+                        fprintf(fp, "P6\n512 448\n255\n");
+                        for (y = 0; y < 448; y++) {
+                            for (x = 0; x < 512; x++) {
+                                fwrite(&px[(y * 512 + x) * 4], 1, 3, fp);
+                            }
+                        }
+                        fclose(fp);
+                    }
+                }
+                free(px);
+            }
+        }
     }
     /* Present interval one already blocks on the display vblank. Do not add a second software timer here:
        double pacing makes 30 Hz animation ticks land alternately early and late. */
@@ -1442,6 +1646,7 @@ static void d3d9_target_ensure(int index) {
     if (target->color != NULL) {
         return;
     }
+    d3d9_target_set_cleared(index, 0);
     target->color = (D3d9Texture *)calloc(1, sizeof(*target->color));
     target->aux = (D3d9Texture *)calloc(1, sizeof(*target->aux));
     if (target->color == NULL || target->aux == NULL) {
@@ -1475,7 +1680,7 @@ static void d3d9_target_ensure(int index) {
     target->aux->width = width;
     target->aux->height = height;
     target->aux->renderTarget = 1;
-    hr = sDevice->lpVtbl->CreateDepthStencilSurface(sDevice, width, height, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &target->depth, NULL);
+    hr = sDevice->lpVtbl->CreateDepthStencilSurface(sDevice, width, height, sDepthFormat, D3DMULTISAMPLE_NONE, 0, TRUE, &target->depth, NULL);
     if (FAILED(hr)) {
         d3d9_target_release(target);
     }
@@ -1487,6 +1692,7 @@ static void d3d9_target_drop(int index) {
             sD3d9AuxCopyTarget = -1;
         }
         d3d9_target_release(&sTargets[index]);
+        d3d9_target_set_cleared(index, 0);
     }
 }
 
@@ -1511,6 +1717,7 @@ static int d3d9_pipe_get(uint32_t key) {
 static void d3d9_set_target(int index) {
     IDirect3DSurface9 *color;
     IDirect3DSurface9 *depth;
+    DWORD clearFlags;
     if (index < 0 || index >= MAX_TARGETS || sTargets[index].color == NULL || sDevice == NULL) {
         return;
     }
@@ -1528,14 +1735,20 @@ static void d3d9_set_target(int index) {
         sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
     }
     d3d9_set_viewport((int)sTargets[index].color->width, (int)sTargets[index].color->height);
-    if (!sTargetSeen[index]) {
+    sD3d9ScissorValid = 0;
+    if (!d3d9_target_is_cleared(index)) {
+        clearFlags = D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER;
+        if (sDepthFormat == D3DFMT_D24S8) {
+            clearFlags |= D3DCLEAR_STENCIL;
+        }
         HRESULT hr = sDevice->lpVtbl->Clear(sDevice, 0, NULL,
-                                             D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+                                             clearFlags,
                                              D3DCOLOR_ARGB(0, 0, 0, 0), 0.0f, 0);
         if (FAILED(hr)) {
             d3d9_log_hr("Clear(target/depth)", hr);
+        } else {
+            d3d9_target_set_cleared(index, 1);
         }
-        sTargetSeen[index] = 1;
     }
     if (sD3d9Telemetry.enabled && sD3d9LastTarget != (uint32_t)index) {
         sD3d9Telemetry.targetChanges++;
@@ -1546,6 +1759,7 @@ static void d3d9_set_target(int index) {
 
 static void d3d9_set_scissor(const int *scissor) {
     RECT rect;
+    HRESULT hr;
     if (sDevice == NULL || scissor == NULL) {
         return;
     }
@@ -1556,8 +1770,18 @@ static void d3d9_set_scissor(const int *scissor) {
     if (sD3d9ScissorValid && memcmp(sD3d9Scissor, scissor, sizeof(sD3d9Scissor)) == 0) {
         return;
     }
-    sDevice->lpVtbl->SetScissorRect(sDevice, &rect);
-    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
+    hr = sDevice->lpVtbl->SetScissorRect(sDevice, &rect);
+    if (FAILED(hr)) {
+        d3d9_log_hr("SetScissorRect", hr);
+        sD3d9ScissorValid = 0;
+        return;
+    }
+    hr = sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
+    if (FAILED(hr)) {
+        d3d9_log_hr("SetRenderState(SCISSORTESTENABLE)", hr);
+        sD3d9ScissorValid = 0;
+        return;
+    }
     memcpy(sD3d9Scissor, scissor, sizeof(sD3d9Scissor));
     sD3d9ScissorValid = 1;
 }
@@ -1654,17 +1878,23 @@ static void d3d9_vu_project(float sx, float sy, float sz, float sw,
                              float vpW, float vpH,
                              float *px, float *py, float *pz, float *prhw) {
     float nx, ny, nd;
-    if (sw <= 0.0f) { *px = *py = 0.0f; *pz = 0.0f; *prhw = 1.0f; return; }
+    /* Depth-clamp emulation (see D3D9_VU_PROJ_HLSL): a vertex behind the eye is kept with a small
+       positive w and nearest depth, matching the OpenGL / SDL GPU back ends' clamped depth. */
+    float useW = sw > 0.0f ? sw : 1.0e-4f;
     /* NDC: x in [-1,1] based on GS 512-wide space, y inverted; z in [0,1]. */
-    nx = (sx - offx * sw) / (512.0f * sw) - 1.0f;
-    ny = 1.0f - (sy - offy * sw) / (512.0f * sw);
-    /* depth: same as GL -- floor(s.z/s.w)+0.5 / depthMax, clamped [0,1] */
-    if (depthMax > 0.0f) {
-        nd = ((float)(int)(sz / sw) + 0.5f) / depthMax;
+    nx = (sx - offx * useW) / (512.0f * useW) - 1.0f;
+    ny = 1.0f - (sy - offy * useW) / (512.0f * useW);
+    if (sw <= 0.0f) {
+        /* behind the eye: nearest depth, as GL_DEPTH_CLAMP clamps NDC z below 0 to 0 (also avoids
+           dividing huge z by the tiny w, which would overflow the float range) */
+        nd = 0.0f;
+    } else if (depthMax > 0.0f) {
+        /* depth: same as GL -- floor(s.z/s.w)+0.5 / depthMax, clamped [0,1] */
+        nd = ((float)(int)(sz / useW) + 0.5f) / depthMax;
         if (nd < 0.0f) nd = 0.0f;
         if (nd > 1.0f) nd = 1.0f;
     } else {
-        nd = sz / sw;
+        nd = sz / useW;
         if (nd < 0.0f) nd = 0.0f;
         if (nd > 1.0f) nd = 1.0f;
     }
@@ -1673,8 +1903,365 @@ static void d3d9_vu_project(float sx, float sy, float sz, float sw,
     *px = (nx + 1.0f) * 0.5f * vpW - 0.5f;
     *py = (1.0f - ny) * 0.5f * vpH - 0.5f; /* D3D9 Y=0 is top */
     *pz = nd;
-    *prhw = 1.0f / sw;
+    *prhw = 1.0f / useW;
 }
+
+#ifndef D3D9_BACKEND_PROBE
+static float d3d9_trace_clip_distance(const float vertex[4], unsigned plane) {
+    switch (plane) {
+    case 0: return vertex[0] + vertex[3];
+    case 1: return vertex[3] - vertex[0];
+    case 2: return vertex[1] + vertex[3];
+    case 3: return vertex[3] - vertex[1];
+    case 4: return vertex[2];
+    default: return vertex[3] - vertex[2];
+    }
+}
+
+static unsigned d3d9_trace_clip_triangle(const float triangle[3][4], unsigned planeCount) {
+    float a[12][4], b[12][4];
+    unsigned count = 3, plane, i, component;
+    memcpy(a, triangle, sizeof(float) * 12);
+    for (plane = 0; plane < planeCount && count != 0; plane++) {
+        unsigned nextCount = 0;
+        for (i = 0; i < count; i++) {
+            unsigned previous = (i + count - 1) % count;
+            float previousDistance = d3d9_trace_clip_distance(a[previous], plane);
+            float currentDistance = d3d9_trace_clip_distance(a[i], plane);
+            int previousInside = previousDistance >= 0.0f;
+            int currentInside = currentDistance >= 0.0f;
+            if (previousInside != currentInside) {
+                float t = previousDistance / (previousDistance - currentDistance);
+                for (component = 0; component < 4; component++) {
+                    b[nextCount][component] =
+                        a[previous][component] + t * (a[i][component] - a[previous][component]);
+                }
+                nextCount++;
+            }
+            if (currentInside) {
+                memcpy(b[nextCount], a[i], sizeof(float) * 4);
+                nextCount++;
+            }
+        }
+        count = nextCount;
+        memcpy(a, b, sizeof(float) * count * 4);
+    }
+    return count;
+}
+
+static unsigned d3d9_trace_clip_xy_depth(const float triangle[3][5], float polygon[12][5]) {
+    float a[12][5], b[12][5];
+    unsigned count = 3, plane, i, component;
+    memcpy(a, triangle, sizeof(float) * 15);
+    for (plane = 0; plane < 4 && count != 0; plane++) {
+        unsigned nextCount = 0;
+        for (i = 0; i < count; i++) {
+            unsigned previous = (i + count - 1) % count;
+            float previousDistance, currentDistance;
+            switch (plane) {
+            case 0:
+                previousDistance = a[previous][0] + a[previous][4];
+                currentDistance = a[i][0] + a[i][4];
+                break;
+            case 1:
+                previousDistance = a[previous][4] - a[previous][0];
+                currentDistance = a[i][4] - a[i][0];
+                break;
+            case 2:
+                previousDistance = a[previous][1] + a[previous][4];
+                currentDistance = a[i][1] + a[i][4];
+                break;
+            default:
+                previousDistance = a[previous][4] - a[previous][1];
+                currentDistance = a[i][4] - a[i][1];
+                break;
+            }
+            {
+                int previousInside = previousDistance >= 0.0f;
+                int currentInside = currentDistance >= 0.0f;
+                if (previousInside != currentInside) {
+                    float t = previousDistance / (previousDistance - currentDistance);
+                    for (component = 0; component < 5; component++) {
+                        b[nextCount][component] =
+                            a[previous][component] + t * (a[i][component] - a[previous][component]);
+                    }
+                    nextCount++;
+                }
+                if (currentInside) {
+                    memcpy(b[nextCount], a[i], sizeof(float) * 5);
+                    nextCount++;
+                }
+            }
+        }
+        count = nextCount;
+        memcpy(a, b, sizeof(float) * count * 5);
+    }
+    memcpy(polygon, a, sizeof(float) * count * 5);
+    return count;
+}
+
+static unsigned d3d9_trace_clip_scissor(const float polygon[12][4], unsigned count,
+                                         float left, float top, float right, float bottom,
+                                         float clipped[12][4]) {
+    float a[12][4], b[12][4];
+    unsigned plane, i, component;
+    memcpy(a, polygon, sizeof(float) * count * 4);
+    for (plane = 0; plane < 4 && count != 0; plane++) {
+        unsigned nextCount = 0;
+        for (i = 0; i < count; i++) {
+            unsigned previous = (i + count - 1) % count;
+            float previousDistance, currentDistance;
+            switch (plane) {
+            case 0:
+                previousDistance = a[previous][0] - left;
+                currentDistance = a[i][0] - left;
+                break;
+            case 1:
+                previousDistance = right - a[previous][0];
+                currentDistance = right - a[i][0];
+                break;
+            case 2:
+                previousDistance = a[previous][1] - top;
+                currentDistance = a[i][1] - top;
+                break;
+            default:
+                previousDistance = bottom - a[previous][1];
+                currentDistance = bottom - a[i][1];
+                break;
+            }
+            {
+                int previousInside = previousDistance >= 0.0f;
+                int currentInside = currentDistance >= 0.0f;
+                if (previousInside != currentInside) {
+                    float t = previousDistance / (previousDistance - currentDistance);
+                    for (component = 0; component < 4; component++) {
+                        b[nextCount][component] =
+                            a[previous][component] + t * (a[i][component] - a[previous][component]);
+                    }
+                    nextCount++;
+                }
+                if (currentInside) {
+                    memcpy(b[nextCount], a[i], sizeof(float) * 4);
+                    nextCount++;
+                }
+            }
+        }
+        count = nextCount;
+        memcpy(a, b, sizeof(float) * count * 4);
+    }
+    memcpy(clipped, a, sizeof(float) * count * 4);
+    return count;
+}
+
+static void d3d9_trace_vu4_draw(const GsDraw *draw, const Vu0Uniform *u, uint32_t pipelineKey) {
+    static uint32_t loggedFrame = UINT32_MAX;
+    static uint32_t drawInFrame;
+    const char *enabled = getenv("BT3_D3D9_VU4_TRACE");
+    float minX = 1.0e30f, minY = 1.0e30f, maxX = -1.0e30f, maxY = -1.0e30f;
+    float minZ = 1.0e30f, maxZ = -1.0e30f, minW = 1.0e30f, maxW = -1.0e30f;
+    uint32_t sideRejects[4] = {0, 0, 0, 0};
+    uint32_t i, outsideX = 0, outsideY = 0, glDepthOutside = 0, nonPositiveW = 0;
+    uint32_t d3dOnlyClipTriangles = 0, glOnlyClipTriangles = 0, visibleDepthClampDiffTriangles = 0;
+    DWORD actualZEnable = 0, actualZFunc = 0, actualZWrite = 0;
+    RECT actualScissor = {0, 0, 0, 0};
+    HRESULT zEnableHr, zFuncHr, zWriteHr, scissorHr;
+    int actualStateMatches;
+    float maxVisibleDepthDelta = 0.0f;
+    float maxVisibleDeltaX = 0.0f, maxVisibleDeltaY = 0.0f;
+    float width = (float)sTargets[draw->target].color->width;
+    float height = (float)sTargets[draw->target].color->height;
+    float depthMax = u->misc[2];
+    if (enabled == NULL || atoi(enabled) == 0 || sD3d9Telemetry.frame % 30 != 0) return;
+    zEnableHr = sDevice->lpVtbl->GetRenderState(sDevice, D3DRS_ZENABLE, &actualZEnable);
+    zFuncHr = sDevice->lpVtbl->GetRenderState(sDevice, D3DRS_ZFUNC, &actualZFunc);
+    zWriteHr = sDevice->lpVtbl->GetRenderState(sDevice, D3DRS_ZWRITEENABLE, &actualZWrite);
+    scissorHr = sDevice->lpVtbl->GetScissorRect(sDevice, &actualScissor);
+    if (FAILED(zEnableHr)) d3d9_log_hr("GetRenderState(VU4 ZENABLE)", zEnableHr);
+    if (FAILED(zFuncHr)) d3d9_log_hr("GetRenderState(VU4 ZFUNC)", zFuncHr);
+    if (FAILED(zWriteHr)) d3d9_log_hr("GetRenderState(VU4 ZWRITEENABLE)", zWriteHr);
+    if (FAILED(scissorHr)) d3d9_log_hr("GetScissorRect(VU4 trace)", scissorHr);
+    actualStateMatches = SUCCEEDED(zEnableHr) && SUCCEEDED(zFuncHr) && SUCCEEDED(zWriteHr) &&
+                         SUCCEEDED(scissorHr) &&
+                         (DWORD)actualZEnable == (DWORD)(((pipelineKey >> 10) & 3) ? D3DZB_TRUE : D3DZB_FALSE) &&
+                         (DWORD)actualZFunc == (DWORD)(((pipelineKey >> 10) & 3) == 1 ? D3DCMP_ALWAYS :
+                                         ((pipelineKey >> 10) & 3) == 2 ? D3DCMP_GREATEREQUAL : D3DCMP_GREATER) &&
+                         (DWORD)actualZWrite == (DWORD)((pipelineKey >> 12) & 1) &&
+                         actualScissor.left == (LONG)draw->scissor[0] &&
+                         actualScissor.top == (LONG)draw->scissor[1] &&
+                         actualScissor.right == (LONG)(draw->scissor[0] + draw->scissor[2]) &&
+                         actualScissor.bottom == (LONG)(draw->scissor[1] + draw->scissor[3]);
+    if (loggedFrame != sD3d9Telemetry.frame) {
+        loggedFrame = sD3d9Telemetry.frame;
+        drawInFrame = 0;
+        fprintf(stderr, "d3d9-vu4-trace: frame=%u target_size=%.0fx%.0f\n",
+                sD3d9Telemetry.frame, width, height);
+    }
+    for (i = 0; i + 2 < draw->count; i += 3) {
+        float d3dClip[3][4], glClip[3][4];
+        float xyDepthInput[3][5];
+        unsigned v, outLeft = 0, outRight = 0, outTop = 0, outBottom = 0;
+        for (v = 0; v < 3; v++) {
+            uint32_t vertexIndex = gsVuIdx[draw->first + i + v];
+            const float *vertex = &gsVuVerts[vertexIndex * 12];
+            float sx, sy, sz, sw, d3dZ, glZ;
+            d3d9_mat4_vec4(u->screen, vertex[0], vertex[1], vertex[2], vertex[3], &sx, &sy, &sz, &sw);
+            d3dClip[v][0] = (sx - u->misc[0] * sw) / 512.0f - sw;
+            d3dClip[v][1] = sw - (sy - u->misc[1] * sw) / 512.0f;
+            if (sw > 0.0f && depthMax > 0.0f) {
+                d3dZ = (floorf(sz / sw) + 0.5f) / depthMax * sw;
+                glZ = d3dZ;
+                if (d3dZ < 0.0f) d3dZ = 0.0f;
+                if (d3dZ > sw) d3dZ = sw;
+            } else {
+                float ratio = depthMax != 0.0f ? sz / fabsf(depthMax) : 0.0f;
+                if (ratio < 0.0f) ratio = 0.0f;
+                if (ratio > 1.0f) ratio = 1.0f;
+                d3dZ = ratio * sw;
+                glZ = depthMax != 0.0f ? sz / fabsf(depthMax) : 0.0f;
+            }
+            d3dClip[v][2] = d3dZ;
+            d3dClip[v][3] = sw;
+            glClip[v][0] = d3dClip[v][0];
+            glClip[v][1] = -d3dClip[v][1];
+            glClip[v][2] = glZ;
+            glClip[v][3] = sw;
+            xyDepthInput[v][0] = d3dClip[v][0];
+            xyDepthInput[v][1] = d3dClip[v][1];
+            xyDepthInput[v][2] = d3dZ;
+            xyDepthInput[v][3] = glZ;
+            xyDepthInput[v][4] = sw;
+            if (sw > 0.0f) {
+                float glDepth = glZ / sw;
+                if (glDepth < 0.0f || glDepth > 1.0f) glDepthOutside++;
+            }
+            if (sw <= 0.0f) {
+                nonPositiveW++;
+            } else {
+                float px = (d3dClip[v][0] / sw * 0.5f + 0.5f) * width;
+                float py = (0.5f - d3dClip[v][1] / sw * 0.5f) * height;
+                float pz = d3dZ / sw;
+                if (px < minX) minX = px;
+                if (px > maxX) maxX = px;
+                if (py < minY) minY = py;
+                if (py > maxY) maxY = py;
+                if (pz < minZ) minZ = pz;
+                if (pz > maxZ) maxZ = pz;
+                if (sw < minW) minW = sw;
+                if (sw > maxW) maxW = sw;
+                if (d3dClip[v][0] < -sw || d3dClip[v][0] > sw) outsideX++;
+                if (d3dClip[v][1] < -sw || d3dClip[v][1] > sw) outsideY++;
+            }
+            if (d3dClip[v][0] < -sw) outLeft++;
+            if (d3dClip[v][0] > sw) outRight++;
+            if (d3dClip[v][1] < -sw) outTop++;
+            if (d3dClip[v][1] > sw) outBottom++;
+        }
+        if (outLeft == 3) sideRejects[0]++;
+        if (outRight == 3) sideRejects[1]++;
+        if (outTop == 3) sideRejects[2]++;
+        if (outBottom == 3) sideRejects[3]++;
+        if (d3d9_trace_clip_triangle(d3dClip, 6) == 0 &&
+            d3d9_trace_clip_triangle(glClip, 4) != 0) d3dOnlyClipTriangles++;
+        if (d3d9_trace_clip_triangle(d3dClip, 6) != 0 &&
+            d3d9_trace_clip_triangle(glClip, 4) == 0) glOnlyClipTriangles++;
+        {
+            float xyPolygon[12][5], screenPolygon[12][4], scissorPolygon[12][4];
+            unsigned xyCount = d3d9_trace_clip_xy_depth(xyDepthInput, xyPolygon);
+            unsigned screenCount = 0, point;
+            int valid = 1;
+            float left = (float)draw->scissor[0], top = (float)draw->scissor[1];
+            float right = left + (float)draw->scissor[2], bottom = top + (float)draw->scissor[3];
+            if (left < 0.0f) left = 0.0f;
+            if (top < 0.0f) top = 0.0f;
+            if (right > width) right = width;
+            if (bottom > height) bottom = height;
+            left += 0.5f;
+            top += 0.5f;
+            right -= 0.5f;
+            bottom -= 0.5f;
+            for (point = 0; point < xyCount; point++) {
+                float w = xyPolygon[point][4];
+                if (w <= 1.0e-7f) {
+                    valid = 0;
+                    break;
+                }
+                screenPolygon[point][0] = (xyPolygon[point][0] / w * 0.5f + 0.5f) * width;
+                screenPolygon[point][1] = (0.5f - xyPolygon[point][1] / w * 0.5f) * height;
+                screenPolygon[point][2] = xyPolygon[point][2] / w;
+                screenPolygon[point][3] = xyPolygon[point][3] / w;
+            }
+            if (valid && xyCount != 0 && right > left && bottom > top) {
+                screenCount = d3d9_trace_clip_scissor(screenPolygon, xyCount, left, top, right, bottom,
+                                                       scissorPolygon);
+            }
+            if (screenCount != 0) {
+                float triangleMaxDelta = 0.0f, triangleMaxX = 0.0f, triangleMaxY = 0.0f;
+                unsigned edge;
+                for (point = 0; point < screenCount; point++) {
+                    float glDepth = scissorPolygon[point][3];
+                    float delta;
+                    if (glDepth < 0.0f) glDepth = 0.0f;
+                    if (glDepth > 1.0f) glDepth = 1.0f;
+                    delta = fabsf(scissorPolygon[point][2] - glDepth);
+                    if (delta > triangleMaxDelta) {
+                        triangleMaxDelta = delta;
+                        triangleMaxX = scissorPolygon[point][0];
+                        triangleMaxY = scissorPolygon[point][1];
+                    }
+                }
+                for (edge = 0; edge < screenCount; edge++) {
+                    unsigned next = (edge + 1) % screenCount;
+                    float aDepth = scissorPolygon[edge][3], bDepth = scissorPolygon[next][3];
+                    float boundaries[2] = {0.0f, 1.0f};
+                    unsigned boundary;
+                    for (boundary = 0; boundary < 2; boundary++) {
+                        float depth = boundaries[boundary];
+                        if ((aDepth < depth && bDepth > depth) || (aDepth > depth && bDepth < depth)) {
+                            float t = (depth - aDepth) / (bDepth - aDepth);
+                            float d3dDepth = scissorPolygon[edge][2] +
+                                t * (scissorPolygon[next][2] - scissorPolygon[edge][2]);
+                            float delta = fabsf(d3dDepth - depth);
+                            if (delta > triangleMaxDelta) {
+                                triangleMaxDelta = delta;
+                                triangleMaxX = scissorPolygon[edge][0] +
+                                    t * (scissorPolygon[next][0] - scissorPolygon[edge][0]);
+                                triangleMaxY = scissorPolygon[edge][1] +
+                                    t * (scissorPolygon[next][1] - scissorPolygon[edge][1]);
+                            }
+                        }
+                    }
+                }
+                if (triangleMaxDelta > 1.0e-7f) {
+                    visibleDepthClampDiffTriangles++;
+                    if (triangleMaxDelta > maxVisibleDepthDelta) {
+                        maxVisibleDepthDelta = triangleMaxDelta;
+                        maxVisibleDeltaX = triangleMaxX;
+                        maxVisibleDeltaY = triangleMaxY;
+                    }
+                }
+            }
+        }
+    }
+    fprintf(stderr,
+            "d3d9-vu4-trace: frame=%u draw=%u uniform=%d first=%u indices=%u triangles=%u target=%d "
+            "scissor=%d,%d,%d,%d ztest=%u zwrite=%u state_match=%d actual_z=%lu/%lu/%lu "
+            "actual_scissor=%ld,%ld,%ld,%ld mode=%u/%u date=%u "
+            "screen=%.1f,%.1f..%.1f,%.1f z=%.6f..%.6f w=%.3f..%.3f "
+            "outside_xy=%u/%u gl_depth_outside=%u nonpositive_w=%u side_rejects=%u/%u/%u/%u "
+            "clip_survival_d3d_only=%u clip_survival_gl_only=%u "
+            "onscreen_depth_diff_triangles=%u max_onscreen_delta=%.8f@%.1f,%.1f\n",
+            sD3d9Telemetry.frame, drawInFrame++, draw->uniform, draw->first, draw->count, draw->count / 3,
+            draw->target, draw->scissor[0], draw->scissor[1], draw->scissor[2], draw->scissor[3],
+            (pipelineKey >> 10) & 3, (pipelineKey >> 12) & 1, actualStateMatches,
+            (unsigned long)actualZEnable, (unsigned long)actualZFunc, (unsigned long)actualZWrite,
+            (long)actualScissor.left, (long)actualScissor.top, (long)actualScissor.right, (long)actualScissor.bottom,
+            draw->mode[0], draw->mode[1],
+            draw->misc[1] != 0.0f, minX, minY, maxX, maxY, minZ, maxZ, minW, maxW,
+            outsideX, outsideY, glDepthOutside, nonPositiveW, sideRejects[0], sideRejects[1], sideRejects[2],
+            sideRejects[3], d3dOnlyClipTriangles, glOnlyClipTriangles,
+            visibleDepthClampDiffTriangles, maxVisibleDepthDelta, maxVisibleDeltaX, maxVisibleDeltaY);
+}
+#endif
 
 /* Maximum count of VU vertices we will emit per draw call (avoid huge allocations). */
 #define D3D9_VU_MAX_VERTS 65535u
@@ -1695,17 +2282,24 @@ static void d3d9_draw_vu_gpu(const GsDraw *draw) {
     if (sTargets[draw->target].color == NULL) return;
     if (sVuVb == NULL || sVuIb == NULL) return;
 
+    pipeKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     /* Select shader: vu==1 → vu0, vu==2 → vu4, vu==3 → vu6. */
     vs = sVuShader[draw->vu - 1];
+    if (draw->vu == 2 && sD3d9PixelDepthEnabled && (pipeKey & (1u << 23)) == 0 &&
+        sVu4DepthShader != NULL) {
+        vs = sVu4DepthShader;
+    }
     if (vs == NULL) return;
 
     u       = &gsVuUni[draw->uniform];
     texture = d3d9_texture_from_handle(draw->tex);
 
     d3d9_set_target(draw->target);
-    pipeKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     d3d9_apply_pipeline(pipeKey, draw->blendc);
     d3d9_set_scissor(draw->scissor);
+#ifndef D3D9_BACKEND_PROBE
+    if (draw->vu == 2) d3d9_trace_vu4_draw(draw, u, pipeKey);
+#endif
 
     sDevice->lpVtbl->SetVertexDeclaration(sDevice, sVuDecl);
     sDevice->lpVtbl->SetVertexShader(sDevice, vs);
@@ -1984,7 +2578,7 @@ static void d3d9_draw_native3(const GsDraw *draw) {
     sDevice->lpVtbl->SetFVF(sDevice, D3D9_FVF_TEXTURED);
     sDevice->lpVtbl->SetTexture(sDevice, 0, (IDirect3DBaseTexture9 *)sD3d9AuxCopy->texture);
     sD3d9BoundTexture = (uintptr_t)sD3d9AuxCopy->texture;
-    sDevice->lpVtbl->SetTexture(sDevice, 1, (IDirect3DBaseTexture9 *)clut->texture);
+    d3d9_bind_texture1(clut);
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
@@ -2021,6 +2615,14 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         if (draw->native) sD3d9Telemetry.nativeDraws++;
         else if (draw->vu) sD3d9Telemetry.vuDraws++;
         else sD3d9Telemetry.draw2d++;
+        if (draw->vu == 2) {
+            sD3d9Telemetry.vu4Draws++;
+            sD3d9Telemetry.vu4Indices += draw->count;
+        }
+        if (draw->native == 3) sD3d9Telemetry.native3Draws++;
+        if (draw->native == 4) sD3d9Telemetry.native4Draws++;
+        if (draw->native == 5) sD3d9Telemetry.dateSnapshots++;
+        if (!draw->native && draw->misc[1] != 0.0f) sD3d9Telemetry.dateDraws++;
         sD3d9Telemetry.vertices += draw->count;
         if (draw->vu) sD3d9Telemetry.indices += draw->count;
         if (sD3d9LastTexture != draw->tex) {
@@ -2049,6 +2651,13 @@ static void d3d9_draw_gs(const GsDraw *draw) {
     }
     if (draw->native == 4) {
         d3d9_aux_snapshot(draw->target);
+        return;
+    }
+    if (draw->native == 5) {
+        if (draw->target >= 0 && draw->target < MAX_TARGETS && sTargets[draw->target].color != NULL) {
+            d3d9_set_target(draw->target);
+            d3d9_date_snapshot(draw->target);
+        }
         return;
     }
     if (draw->native == 3) {

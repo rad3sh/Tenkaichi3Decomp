@@ -460,6 +460,40 @@ both CLUT sources and the scissor boundary. It also checks GS alpha tests at the
 the D3D9 vertex path keeps RGBAQ alpha raw and applies the GS 255/128 scale once. Other PS2
 memory-view passes remain unsupported.
 
+D3D9 also snapshots the auxiliary alpha channel for native pass 5 and applies the GS destination-alpha
+test in its pixel shader. This is required by some stage layers as well as HUD masks. The presenter
+selects the GS main framebuffer rather than whichever offscreen target happened to receive the last
+draw, and target clear state follows the shared target table so a recycled target is initialized.
+
+D3D9 selects D32 only when the adapter reports a compatible depth-stencil match; the tested
+GeForce GT 610 reports D24S8, so D32 is not available there.
+The terrain edge disappearing near the camera was D3D9 clipping primitives at the near plane
+(w <= 0): the OpenGL back end keeps them with `glEnable(GL_DEPTH_CLAMP)` and the SDL GPU one
+has depth clipping off by default, so stage triangles that crossed the near plane (the ground
+under a low camera) vanished only there and came and went with the camera's movement. The VU
+shader projection (`D3D9_VU_PROJ_HLSL` and the CPU `d3d9_vu_project`) now emulates the depth
+clamp: a vertex behind the eye is given a small positive w and nearest depth, as the other back
+ends' clamped depth does.
+`BT3_D3D9_PIXEL_DEPTH=1` is an experimental parity check: it compiles a `ps_3_0` variant that
+reproduces the GS per-pixel depth quantization for VU4 draws that use the full-depth pipeline.
+It is off by default and may reduce performance by limiting early depth rejection; it has not
+yet been shown to fix the disappearing terrain.
+`BT3_D3D9_VU4_TRACE=1` records VU4 draw bounds, scissor, depth state, per-side trivial rejects,
+and a CPU clip-space comparison every 30 frames. `clip_survival_d3d_only` / `clip_survival_gl_only`
+count triangles left after clipping by D3D9's six homogeneous planes versus OpenGL's four X/Y
+planes with depth clamp. `onscreen_depth_diff_triangles` counts positive-W triangles whose
+projected polygons have a depth difference at pixel-center locations after clipping to the target
+and draw scissor, when D3D9 clamps per vertex but OpenGL depth-clamps after interpolation. This is
+a CPU model, not a GPU capture, so matching results rule out only these modeled differences and do
+not prove identical rasterization or depth-buffer behavior.
+
+After invalidating the D3D9 scissor cache after target/viewport setup, a lightweight 1x, 640x480
+arena trace recorded 79 VU4 draws across four sampled frames: all reported `state_match=1`, and
+the modeled D3D-only / GL-only clip-survival counts were zero. The 29 modeled depth-difference
+triangles had their maximum differences on the draw-scissor edges; this does not explain the
+interior terrain boundary in the screenshot. The scissor-state mismatch is corrected, but this
+change has not been shown to fix the disappearing terrain.
+
 ## Renderer fixes after the user looked at the window (2026-10-06)
 
 - SMEARS TRAILING BEHIND CAMERA PANS ("a trail of textures"), stage picture stuck on the

@@ -1444,6 +1444,7 @@ void GsGpu_DrawVu6(int ctx, const float *vertices, uint32_t count, const float *
 /* Vertex program 4 as a shader: one strip of stage geometry (see shaders/vu4.vert). Vertices: position, colour
    (0..255 floats), texture coordinates, 48 bytes; the screen matrix is VU memory 0..3. */
 void GsGpu_DrawVu4(int ctx, const float *vertices, uint32_t count, const float *consts) {
+    static int capacityWarningLogged;
     if (GS_NO_PICTURE) { /* a frame that is only being re-run, or one that is skipped: nothing is drawn */
         return;
     }
@@ -1452,8 +1453,19 @@ void GsGpu_DrawVu4(int ctx, const float *vertices, uint32_t count, const float *
     float us, vs;
     uint32_t i, k;
 
-    if (count < 3 || gsVuVertCount + count > MAX_VU_VERTS || gsVuIdxCount + (count - 2) * 3 > MAX_VU_IDX || gsDrawCount == MAX_DRAWS ||
-        gsVuUniCount == MAX_VU_UNIFORMS) {
+    if (count < 3) {
+        return;
+    }
+    if (gsVuVertCount + count > MAX_VU_VERTS || gsVuIdxCount + (count - 2) * 3 > MAX_VU_IDX ||
+        gsDrawCount == MAX_DRAWS || gsVuUniCount == MAX_VU_UNIFORMS) {
+        if (!capacityWarningLogged) {
+            fprintf(stderr, "bt3: gs: VU4 stage strip dropped at shared geometry capacity "
+                    "(vertices %u + %u/%u, indices %u + %u/%u, draws %u/%u, uniforms %u/%u)\n",
+                    gsVuVertCount, count, MAX_VU_VERTS,
+                    gsVuIdxCount, (count - 2) * 3, MAX_VU_IDX,
+                    gsDrawCount, MAX_DRAWS, gsVuUniCount, MAX_VU_UNIFORMS);
+            capacityWarningLogged = 1;
+        }
         return;
     }
     if (!draw_state(ctx, 0, 0, 2, &d, &us, &vs)) {
