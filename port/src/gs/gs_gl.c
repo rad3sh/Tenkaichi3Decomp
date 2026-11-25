@@ -1098,14 +1098,18 @@ static void frame_end(void) {
             GLsizei w = 512 * SCALE, h = 448 * SCALE;
             int aux = getenv("BT3_SHOT_AUX") != NULL;
             uint8_t *px = malloc((size_t)w * h * 4);
-            char name[64];
+            char name[600];
             FILE *fp;
             glBindFramebuffer(GL_READ_FRAMEBUFFER, sTgFbo[best]);
             glReadBuffer(aux ? GL_COLOR_ATTACHMENT1 : GL_COLOR_ATTACHMENT0);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, w, h, aux ? GL_RED : GL_RGBA, GL_UNSIGNED_BYTE, px);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-            snprintf(name, sizeof(name), "port/build/shots/gpu_%05u.ppm", gGsFrame);
+            if (getenv("BT3_SHOT_DIR") != NULL) { /* (as the Vulkan back end: another folder, e.g. to compare back ends) */
+                snprintf(name, sizeof(name), "%s/gpu_%05u.ppm", getenv("BT3_SHOT_DIR"), gGsFrame);
+            } else {
+                snprintf(name, sizeof(name), "port/build/shots/gpu_%05u.ppm", gGsFrame);
+            }
             fp = fopen(name, "wb");
             if (fp != NULL) {
                 fprintf(fp, "P6\n%d %d\n255\n", w, h);

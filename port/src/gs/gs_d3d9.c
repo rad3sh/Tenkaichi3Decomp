@@ -44,17 +44,18 @@ typedef struct D3d9Target {
     D3d9Texture *color;
     D3d9Texture *aux;
     IDirect3DSurface9 *depth;
+    IDirect3DTexture9 *depthTex; /* the depth as an INTZ texture (sDepthIntz), read by the depth-fog table pass */
 } D3d9Target;
 
 typedef struct D3d9Vertex {
     float x, y, z, rhw;
     DWORD color;
-    float u, v;
+    float u, v, q; /* the GS's s, t, q: the pixel shader divides (perspective-textured 2D primitives) */
     float depth;
 } D3d9Vertex;
 
 #define D3D9_FVF_COLOR (D3DFVF_XYZRHW | D3DFVF_DIFFUSE)
-#define D3D9_FVF_TEXTURED (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2 | D3DFVF_TEXCOORDSIZE1(1))
+#define D3D9_FVF_TEXTURED (D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2 | D3DFVF_TEXCOORDSIZE3(0) | D3DFVF_TEXCOORDSIZE1(1))
 
 /* ---- GPU VU shader path state ---------------------------------------------------------------- */
 
@@ -72,8 +73,11 @@ typedef struct D3d9Vertex {
      c15      : color0
      c16      : color1
      c17      : misc
-     c18      : light2   */
-#define D3D9_VU_CONST_COUNT 19  /* float4 registers */
+     c18      : light2
+     c19      : target  (x: GS pixels per texel, a glow work buffer at the PS2's resolution)
+     c20      : xy = half a pixel of the render target in clip units (D3D9 samples pixels at their corner,
+                the other APIs at their centre; the 2D path subtracts the same half pixel) */
+#define D3D9_VU_CONST_COUNT 21  /* float4 registers */
 
 /* Dynamically loaded D3DCompile function pointer (d3dcompiler_47.dll / d3dcompiler_43.dll). */
 typedef HRESULT (WINAPI *PFN_D3DCompile)(
@@ -87,7 +91,7 @@ static PFN_D3DCompile sD3dCompileFn;
 
 /* The three VS programs (NULL if compilation failed → CPU fallback). */
 static IDirect3DVertexShader9 *sVuShader[3]; /* [0]=vu0, [1]=vu4, [2]=vu6 */
-static IDirect3DVertexShader9 *sVu4DepthShader;
+static IDirect3DVertexShader9 *sVuClampShader[3]; /* the DEPTH_CLAMP variants (geometry crossing the camera's plane) */
 static IDirect3DVertexDeclaration9 *sVuDecl;
 static int sVuShaderReady; /* 1 if all three shaders + declaration are valid */
 static int sD3d9PixelDepthEnabled;
@@ -102,107 +106,129 @@ static uint32_t sVuIbCapacity; /* in indices */
 
 /* ---- ps_3_0 GS pixel shader state ----------------------------------------------------------- */
 /*
- * sGsPs implements the essential behaviour of shaders/gs.frag as a ps_3_0 HLSL shader.
+ * sGsPs implements shaders/gs.frag as a ps_3_0 HLSL shader.
  *
  * PS constant registers (float4):
  *   c0  mode  : x=textured (0/1/2/3), y=TFX (0=MODULATE, 1=DECAL, 2=HIGHLIGHT),
  *                z=TCC (0=RGB only, 1=RGBA), w=alpha-test function index (0=off, else ATST+1)
- *   c1  misc  : x=AREF (0..128 GS units), y=dest-alpha-test (0 off; 1/2: unused here),
- *                z=FBA (1 = set alpha bit 7), w=2D-pixel-scale (0 = sample per fragment)
- *   c2  rect  : uv clamp region for frame-buffer-as-texture (u0,v0,u1,v1)
+ *   c1  misc  : x=AREF (0..128 GS units), y=dest-alpha-test (0 off; 1 pass where bit 7 is 0, 2 where it is 1),
+ *                z=FBA (1 = set alpha bit 7), w=2D sprite: output pixels per GS pixel (0 = per fragment;
+ *                negative = the smooth / texture-pack rules of gs.frag)
+ *   c2  rect  : uv clamp region (frame buffer as texture, or the piece of a sheet a 2D sprite may sample)
  *   c3  orig  : xy=original texture size, z=largest original alpha, w=smooth-2D flag
  *   c4  extra : x=depth maximum, y=blendc (pre-multiply flag), z=0, w=0
+ *   c5  target: xy=render-target size, zw=reciprocal size (for the DATE copy)
+ *   c6  texel : xy=bound texture size, zw=reciprocal size (gs.frag's textureSize)
  *
- * Limitations vs gs.frag:
- *   - 2D sub-pixel snap (misc.w != 0 paths) is approximated as plain uv pass-through;
- *     the GS-pixel-grid clamping is preserved via rect when mode.x==2.
- *   - mode.x==3 (texture pack replacements) is treated identically to mode.x==1.
+ * Not ported: GS_BLOCK (gswb.frag, key bit 25): only drawn with BT3_GLOW_NATIVE=0 at 2x and above.
  */
 static IDirect3DPixelShader9 *sGsPs; /* NULL → fixed-function fallback */
 static IDirect3DPixelShader9 *sGsPsDepth;
 static IDirect3DPixelShader9 *sD3d9OutlinePs;
 static IDirect3DPixelShader9 *sD3d9ClutPs;
 static int sGsPsReady;               /* 1 when sGsPs != NULL and was successfully set */
+static int sD3d9DepthPsDraw;         /* the next VU draw takes its depth from the pixel shader (near-plane clamp) */
 
 /* HLSL source for the GS pixel shader (ps_3_0). */
 static const char kGsPsSrc[] =
-    /* PS constant registers */
-    "float4 psMode  : register(c0);\n"  /* x=textured, y=TFX, z=TCC, w=ATST+1 (0=off) */
-    "float4 psMisc  : register(c1);\n"  /* x=AREF, y=date, z=FBA, w=2D-scale */
-    "float4 psRect  : register(c2);\n"  /* u0,v0,u1,v1 */
-    "float4 psOrig  : register(c3);\n"  /* xy=origSz, z=maxAlpha, w=smooth */
-    "float4 psExtra : register(c4);\n"  /* y=blendc (extra.y != 0 → premultiply alpha) */
-    "float4 psTarget : register(c5);\n" /* xy=target size, zw=reciprocal size */
-    /* Sampler */
+    "float4 psMode  : register(c0);\n"
+    "float4 psMisc  : register(c1);\n"
+    "float4 psRect  : register(c2);\n"
+    "float4 psOrig  : register(c3);\n"
+    "float4 psExtra : register(c4);\n"
+    "float4 psTarget : register(c5);\n"
+    "float4 psTexel : register(c6);\n"
     "sampler2D tex : register(s0);\n"
     "sampler2D dateTex : register(s1);\n"
-    /* Default path receives depth on TEXCOORD1. The experimental WRITE_DEPTH path uses TEXCOORD2
-       for clip-space z/w so the pixel shader can reproduce the interpolated depth. */
+    /* TEXCOORD0 carries (s, t, q) as the GS interpolates them: linearly over the screen for 2D primitives,
+       divided per pixel. The WRITE_DEPTH variant takes clip-space z and w on TEXCOORD2 and writes the depth
+       itself: the GS's whole-number depth, and the depth clamp of the other back ends for VU geometry that
+       crosses the camera's plane (d3d9_vu_crosses_eye). */
     "#ifdef WRITE_DEPTH\n"
-    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; float2 depthZW : TEXCOORD2; float2 pos : VPOS; };\n"
+    "struct PS_IN { float4 col : COLOR0; float3 stq : TEXCOORD0; float2 depthZW : TEXCOORD2; float2 pos : VPOS; };\n"
     "struct PS_OUT { float4 color : COLOR0; float4 aux : COLOR1; float depth : DEPTH; };\n"
-    "#define GS_DEPTH saturate(i.depthZW.x / max(i.depthZW.y, 1.0e-20))\n"
+    "#define GS_DEPTH saturate(i.depthZW.x / i.depthZW.y)\n"
     "#else\n"
-    "struct PS_IN { float4 col : COLOR0; float2 uv : TEXCOORD0; float depth : TEXCOORD1; float2 pos : VPOS; };\n"
+    "struct PS_IN { float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; float2 pos : VPOS; };\n"
     "struct PS_OUT { float4 color : COLOR0; float4 aux : COLOR1; };\n"
     "#define GS_DEPTH saturate(i.depth)\n"
     "#endif\n"
+    "float2 step2(float2 v) { return float2(v.x >= 0.0 ? 1.0 : 0.0, v.y >= 0.0 ? 1.0 : 0.0); }\n"
     "PS_OUT main(PS_IN i) {\n"
     "    if (psMisc.y != 0.0) {\n"
-    "        float stored = tex2D(dateTex, i.pos * psTarget.zw).r;\n"
+    "        float stored = tex2Dlod(dateTex, float4((i.pos + 0.5) * psTarget.zw, 0.0, 0.0)).r;\n"
     "        bool set = stored >= (127.5 / 255.0);\n"
     "        if (set != (psMisc.y > 1.5)) clip(-1.0);\n"
     "    }\n"
-    /* GS alpha scale k = 255/128 ≈ 1.9922; carried through vColor.a * k. */
     "    float k = 255.0 / 128.0;\n"
     "    float3 rgb = i.col.rgb;\n"
     "    float  a   = i.col.a * k;\n"
+    "    float2 uv = i.stq.xy / i.stq.z;\n"
+    "    float2 dx = ddx(uv), dy = ddy(uv);\n"
     "    if (psMode.x != 0.0) {\n"
-    "        float2 uv = i.uv;\n"
-    /* Clamp for frame-buffer-as-texture (mode.x==2) or tight 2D sheets. */
+    "        if (psMisc.w != 0.0) {\n"
+    /* A 2D sprite: the texture coordinate where the GS takes it, at the whole GS pixel this fragment belongs
+       to (gs.frag). VPOS is the pixel's corner in D3D9; gl_FragCoord is its centre. */
+    "            float s = abs(psMisc.w);\n"
+    "            float2 f = i.pos + 0.5, g = floor(f / s) * s;\n"
+    "            float2 at = uv - (dx * (f.x - g.x) + dy * (f.y - g.y));\n"
+    "            float2 inset = 0.5 * psTexel.zw;\n"
+    "            if (psMisc.w > 0.0) {\n"
+    "                uv = at;\n"
+    "            } else if (psMode.x != 3.0 || psOrig.w != 0.0) {\n"
+    "                uv = clamp(uv, psRect.xy + inset, psRect.zw - inset);\n"
+    "            } else {\n"
+    "                float2 o = (f - g) / s, st = float2(dx.x, dy.y) * s * psOrig.xy;\n"
+    "                float2 snapped = (floor(at * psOrig.xy + sign(st) / 64.0) + lerp(1.0 - o, o, step2(st))) / psOrig.xy;\n"
+    "                float2 carried = at + (o - 0.5) * float2(dx.x, dy.y) * s;\n"
+    "                float2 one = abs(abs(st) - 1.0);\n"
+    "                uv = float2(one.x < 0.02 ? snapped.x : carried.x, one.y < 0.02 ? snapped.y : carried.y);\n"
+    "                uv = clamp(uv, psRect.xy + inset, psRect.zw - inset);\n"
+    "            }\n"
+    "        }\n"
     "        if (psMode.x == 2.0) uv = clamp(uv, psRect.xy, psRect.zw);\n"
-    "        float4 t = tex2D(tex, uv);\n"
-    /* Textures from GS memory / replacements: scale alpha by k (0x80 = fully opaque). */
+    "        float4 t = tex2Dgrad(tex, uv, dx, dy);\n"
     "        if (psMode.x == 1.0 || psMode.x == 3.0) t.a *= k;\n"
-    /* Clamp replacement alpha to original's max; treat near-opaque as opaque. */
-    "        if (psMode.x == 3.0 && psOrig.z < 1.0) t.a = min(t.a, psOrig.z);\n"
-    "        else if (psMode.x == 3.0 && t.a > 0.93 && t.a < 1.0) t.a = 1.0;\n"
-    /* TFX 0: MODULATE (the GS's 0x80 colour scale is k = 255/128). */
+    "        if (psMode.x == 3.0) {\n"
+    "            if (psOrig.z < 1.0) t.a = min(t.a, psOrig.z);\n"
+    "            else if (t.a > 0.93 && t.a < 1.0) t.a = 1.0;\n"
+    "        }\n"
     "        if (psMode.y == 0.0) {\n"
-    "            rgb = t.rgb * i.col.rgb * k;\n"    "            if (psMode.z != 0.0) a = t.a * a;\n"
-    /* TFX 1: DECAL     (t.rgb; optional t.a) */
+    "            rgb = t.rgb * i.col.rgb * k;\n"
+    "            if (psMode.z != 0.0) a = t.a * a;\n"
     "        } else if (psMode.y == 1.0) {\n"
     "            rgb = t.rgb;\n"
     "            if (psMode.z != 0.0) a = t.a;\n"
-    /* TFX 2: HIGHLIGHT  (t * vColor * k + vColor.a; optional t.a + a) */
     "        } else {\n"
     "            rgb = t.rgb * i.col.rgb * k + i.col.aaa;\n"
     "            if (psMode.z != 0.0) a = (psMode.y == 2.0) ? t.a + a : t.a;\n"
     "        }\n"
     "    }\n"
-    /* Alpha test (ATST). psMode.w == 0 → off. psMode.w-1 gives ATST index 0..7.
-       Use a float kill value: clip(v) discards the fragment when v < 0. */
+    /* Alpha test (ATST): psMode.w - 1 is the GS's function. A texture pack's replacement (mode.x == 3) is
+       tested at half the reference with a wider tolerance, as gs.frag does. */
     "    if (psMode.w != 0.0) {\n"
     "        float ag = floor(a * 128.0 + 0.5);\n"
     "        int f = (int)psMode.w - 1;\n"
-    "        float ref = psMisc.x;\n"
+    "        float ref = psMode.x == 3.0 ? psMisc.x * 0.5 : psMisc.x;\n"
+    "        float tol = psMode.x == 3.0 ? max(ref, 0.5) : 0.5;\n"
     "        float killv;\n"
     "        if      (f == 0) killv = -1.0;\n"
     "        else if (f == 1) killv =  1.0;\n"
-    "        else if (f == 2) killv = ref - ag - 0.001;\n"   /* pass when ag < ref  */
-    "        else if (f == 3) killv = ref - ag + 0.001;\n"   /* pass when ag <= ref */
-    "        else if (f == 4) killv = 0.5 - abs(ag - ref);\n" /* pass when |ag-ref|<0.5 */
-    "        else if (f == 5) killv = ag - ref + 0.001;\n" /* pass when ag >= ref */
-    "        else if (f == 6) killv = ag - ref - 0.001;\n" /* pass when ag > ref  */
-    "        else             killv = abs(ag - ref) - 0.5;\n" /* pass when |ag-ref|>=0.5 */
+    "        else if (f == 2) killv = ref - ag - 0.001;\n"
+    "        else if (f == 3) killv = ref - ag + 0.001;\n"
+    "        else if (f == 4) killv = tol - abs(ag - psMisc.x) - 0.001;\n"
+    "        else if (f == 5) killv = ag - ref + 0.001;\n"
+    "        else if (f == 6) killv = ag - ref - 0.001;\n"
+    "        else             killv = abs(ag - psMisc.x) - tol + 0.001;\n"
     "        clip(killv);\n"
     "    }\n"
-    /* extra.y != 0: pre-multiply colour by alpha (GS As/0x80 blending above 0x80). */
     "    if (psExtra.y != 0.0) rgb *= a;\n"
     "    PS_OUT out0;\n"
     "    out0.color.rgb = clamp(rgb, 0.0, 1.0);\n"
     "    out0.color.a   = clamp(a,   0.0, 1.0);\n"
-    "    out0.aux = float4(clamp(a * 128.0 / 255.0, 0.0, 1.0), GS_DEPTH, 0.0, 1.0);\n"
+    "    float ab = clamp(a * 128.0 / 255.0, 0.0, 1.0);\n"
+    "    if (psMisc.z != 0.0) { float v = floor(ab * 255.0 + 0.5); ab = (v >= 128.0 ? v : v + 128.0) / 255.0; }\n"
+    "    out0.aux = float4(ab, GS_DEPTH, 0.0, 1.0);\n"
     "#ifdef WRITE_DEPTH\n"
     "    float depth = GS_DEPTH;\n"
     "    if (psExtra.x > 0.0 && psExtra.x < 2.0e7) {\n"
@@ -224,7 +250,7 @@ static const char kD3d9ClutPsSrc[] =
     "    float4 src = tex2D(srcTex, i.uv);\n"
     "    float index;\n"
     "    if (params.x < 0.5) {\n"
-    "        float z = src.g * params.y;\n"
+    "        float z = (params.z > 0.5 ? src.r : src.g) * params.y;\n"
     "        index = z >= 65448.0 ? 0.0 : clamp(255.0 - floor(z / 256.0), 0.0, 255.0);\n"
     "    } else {\n"
     "        index = floor(src.r * 255.0 + 0.5);\n"
@@ -255,6 +281,12 @@ static uint32_t sPipeKeys[1024];
 static D3DFORMAT sAuxFormat = D3DFMT_A8R8G8B8;
 static D3DFORMAT sRgbaTextureFormat = D3DFMT_A8R8G8B8;
 static D3DFORMAT sDepthFormat = D3DFMT_D24S8;
+/* INTZ: a 24-bit depth / 8-bit stencil buffer that can also be sampled (NVIDIA since G80, AMD since HD 4000,
+   Intel since HD 2000). The depth-fog table pass (native 3, source 0) reads the real depth from it; without it the
+   pass reads the 8 bits of depth kept in the auxiliary target, which was too coarse: the fog's alpha, which also
+   feeds the glare and the object glow, came out wrong (the stage glowed). */
+#define D3D9_FMT_INTZ ((D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z'))
+static int sDepthIntz;
 static int sD3d9MrtReady;
 static D3d9Texture *sD3d9AuxCopy;
 static D3d9Texture *sD3d9DateCopy;
@@ -285,6 +317,7 @@ typedef struct D3d9Telemetry {
     uint32_t native4Draws;
     uint32_t dateSnapshots;
     uint32_t dateDraws;
+    uint32_t clampDraws;
     uint64_t vertices;
     uint64_t indices;
     uint64_t vu4Indices;
@@ -358,11 +391,11 @@ static void d3d9_telemetry_log_frame(uint64_t frameNs) {
     if (!sD3d9Telemetry.enabled) return;
     if (frameNs > 16670000ull) sD3d9Telemetry.frames16++;
     if (frameNs > 33330000ull) sD3d9Telemetry.frames33++;
-    fprintf(stderr, "d3d9-telemetry: frame=%u draws=%u vu_draws=%u vu4_draws=%u vu4_indices=%llu draws_2d=%u native=%u native3=%u native4=%u date_snapshots=%u date_draws=%u vertices=%llu indices=%llu targets=%u textures=%u pipelines=%u upload_ms=%.3f submit_ms=%.3f present_ms=%.3f frame_ms=%.3f over16=%u over33=%u\n",
+    fprintf(stderr, "d3d9-telemetry: frame=%u draws=%u vu_draws=%u vu4_draws=%u vu4_indices=%llu draws_2d=%u native=%u native3=%u native4=%u date_snapshots=%u date_draws=%u clamp_draws=%u vertices=%llu indices=%llu targets=%u textures=%u pipelines=%u upload_ms=%.3f submit_ms=%.3f present_ms=%.3f frame_ms=%.3f over16=%u over33=%u\n",
             sD3d9Telemetry.frame, sD3d9Telemetry.draws, sD3d9Telemetry.vuDraws,
             sD3d9Telemetry.vu4Draws, (unsigned long long)sD3d9Telemetry.vu4Indices, sD3d9Telemetry.draw2d,
             sD3d9Telemetry.nativeDraws, sD3d9Telemetry.native3Draws, sD3d9Telemetry.native4Draws,
-            sD3d9Telemetry.dateSnapshots, sD3d9Telemetry.dateDraws,
+            sD3d9Telemetry.dateSnapshots, sD3d9Telemetry.dateDraws, sD3d9Telemetry.clampDraws,
             (unsigned long long)sD3d9Telemetry.vertices,
             (unsigned long long)sD3d9Telemetry.indices, sD3d9Telemetry.targetChanges,
             sD3d9Telemetry.textureChanges, sD3d9Telemetry.pipelineChanges,
@@ -372,7 +405,7 @@ static void d3d9_telemetry_log_frame(uint64_t frameNs) {
     sD3d9Telemetry.draws = sD3d9Telemetry.vuDraws = sD3d9Telemetry.vu4Draws = 0;
     sD3d9Telemetry.draw2d = sD3d9Telemetry.nativeDraws = 0;
     sD3d9Telemetry.native3Draws = sD3d9Telemetry.native4Draws = 0;
-    sD3d9Telemetry.dateSnapshots = sD3d9Telemetry.dateDraws = 0;
+    sD3d9Telemetry.dateSnapshots = sD3d9Telemetry.dateDraws = sD3d9Telemetry.clampDraws = 0;
     sD3d9Telemetry.vertices = sD3d9Telemetry.indices = 0;
     sD3d9Telemetry.vu4Indices = 0;
     sD3d9Telemetry.targetChanges = sD3d9Telemetry.textureChanges = sD3d9Telemetry.pipelineChanges = 0;
@@ -405,43 +438,52 @@ static void d3d9_log_hr(const char *what, HRESULT hr) {
  * TEXCOORD0 carries (s, t, 1) for the fixed-function texture stage.
  */
 
-/* Helper macro: the common screen-space formula used by all three programs.
-   Returns clip-space (px,py,pz,pw) from post-transform (sx,sy,sz,sw) and misc (offx,offy,depthMax).
-   Depth-clamp emulation: D3D9 always clips primitives at the near plane (w <= 0), while the OpenGL
-   back end keeps them with glEnable(GL_DEPTH_CLAMP) and the SDL GPU one has depth clipping off by
-   default. Stage triangles that cross the near plane (the ground under a low camera) therefore
-   vanished there and came and went with the camera's movement. A vertex behind the eye is given a
-   small positive w instead (GL clamps its NDC depth to 0) so the primitive is kept and rasterised
-   across the screen where it crosses, limited by the scissor, as the other back ends' depth clamp
-   does. */
+/* The uniform block of shaders/vu0.vert as VS registers (the three programs share it). */
+#define D3D9_VU_UNIFORMS_HLSL \
+    "column_major float4x4 boneA  : register(c0);\n" \
+    "column_major float4x4 boneB  : register(c4);\n" \
+    "float4 pivotA : register(c8);\n" \
+    "float4 pivotB : register(c9);\n" \
+    "column_major float4x4 screen : register(c10);\n" \
+    "float4 light  : register(c14);\n" \
+    "float4 color0 : register(c15);\n" \
+    "float4 color1 : register(c16);\n" \
+    "float4 misc   : register(c17);\n" \
+    "float4 light2 : register(c18);\n" \
+    "float4 target : register(c19);\n" \
+    "float4 halfPixel : register(c20);\n" \
+    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1;\n" \
+    "                float2 depthZW : TEXCOORD2; };\n"
+
+/* The screen-space formula of all three programs (gl_Position in vu0.vert / vu4.vert / vu6.vert), from the
+   post-transform s. `z` is the depth the other back ends interpolate (the GS whole number plus a half).
+   D3D9 always clips at the near plane z = 0 and the far plane z = w, while the OpenGL back end draws with
+   GL_DEPTH_CLAMP and the SDL GPU one without depth clipping: they keep a stage triangle that crosses the
+   camera's plane (the ground under a low camera) and clamp its depth. Here every vertex in front of the camera
+   gets its depth clamped into [0, w], which never clips; a draw with a vertex behind the camera is drawn with
+   the DEPTH_CLAMP variant (d3d9_vu_crosses_eye): z = w / 2 keeps everything with w > 0, as the depth clamp
+   does, and the pixel shader writes the depth from depthZW. */
 #define D3D9_VU_PROJ_HLSL \
-    "float4 vu_proj(float sx, float sy, float sz, float sw, float offx, float offy, float depthMax) {\n" \
-    "    float w = sw;\n" \
-    "    float useW = w > 0.0 ? w : 1.0e-4;\n" \
-    "    float nx = (sx - offx * useW) / 512.0 - useW;\n" \
-    "    float ny = useW - (sy - offy * useW) / 512.0;\n" \
-    "    float nd;\n" \
-    "    if (w <= 0.0) { nd = 0.0; }\n" \
-    "    else if (depthMax > 0.0) { nd = (floor(sz / useW) + 0.5) / depthMax * useW; nd = clamp(nd, 0.0, useW); }\n" \
-    "    else { nd = clamp(sz / abs(depthMax), 0.0, 1.0) * useW; }\n" \
-    "    return float4(nx, ny, nd, useW);\n" \
+    "void vu_proj(float4 s, inout VS_OUT o) {\n" \
+    "    float tx = target.x > 0.0 ? 512.0 * target.x : 512.0;\n" \
+    "    float z = s.z / abs(misc.z);\n" \
+    "    if (s.w > 0.0 && misc.z > 0.0) z = (floor(s.z / s.w) + 0.5) / misc.z * s.w;\n" \
+    "    o.pos = float4((s.x - misc.x * s.w) / tx - s.w, s.w - (s.y - misc.y * s.w) / tx, 0.0, s.w);\n" \
+    "    o.pos.xy += float2(-halfPixel.x, halfPixel.y) * s.w;\n" \
+    "    o.depthZW = float2(z, s.w);\n" \
+    "#ifdef DEPTH_CLAMP\n" \
+    "    o.pos.z = 0.5 * s.w;\n" \
+    "#else\n" \
+    "    o.pos.z = clamp(z, 0.0, max(s.w, 0.0));\n" \
+    "#endif\n" \
+    "    o.depth = s.w > 0.0 ? saturate(z / s.w) : 1.0;\n" \
     "}\n"
 
 static const char kVu0HlslSrc[] =
-    /* vu0.vert: two-bone skinning, multiple sub-modes from misc.w */
-    "column_major float4x4 boneA  : register(c0);\n"
-    "column_major float4x4 boneB  : register(c4);\n"
-    "float4 pivotA : register(c8);\n"
-    "float4 pivotB : register(c9);\n"
-    "column_major float4x4 screen : register(c10);\n"
-    "float4 light  : register(c14);\n"
-    "float4 color0 : register(c15);\n"
-    "float4 color1 : register(c16);\n"
-    "float4 misc   : register(c17);\n"
-    "float4 light2 : register(c18);\n"
+    /* vu0.vert: two-bone skinning, sub-modes from misc.w */
+    D3D9_VU_UNIFORMS_HLSL
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inNormal : NORMAL; float4 inSt : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; };\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
     "    float miscW = misc.w;\n"
@@ -450,14 +492,29 @@ static const char kVu0HlslSrc[] =
     "    float3 pb = mul(boneB, float4(i.inPos.xyz - pivotB.xyz, 1.0)).xyz;\n"
     "    float4 s  = mul(screen, float4(lerp(pb, pa, w), 1.0));\n"
     "    if (miscW == 2.0 && s.w < 0.0) s = -s;\n"
-    "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
-    "    if (miscW == 2.0) o.pos.z = clamp(s.z / abs(misc.z), 0.0, 1.0) * s.w;\n"
-    "    o.depth = saturate(o.pos.z / o.pos.w);\n"
+    "    vu_proj(s, o);\n"
+    "    if (miscW == 2.0) {\n"
+    "        float z2 = clamp(s.z / abs(misc.z), 0.0, s.w);\n"
+    "        o.depthZW.x = z2;\n"
+    "        o.depth = saturate(z2 / s.w);\n"
+    "#ifndef DEPTH_CLAMP\n"
+    "        o.pos.z = z2;\n"
+    "#endif\n"
+    "    }\n"
     "    float4 cr; float2 uv;\n"
     "    if (miscW == 5.0) {\n"
     "        float4 n1 = float4(i.inNormal.xyz, 1.0);\n"
     "        uv = float2(dot(light, n1) * 0.5 + 0.5, dot(light2, n1) * 0.5 + 0.5);\n"
     "        cr = saturate(color1 / 255.0);\n"
+    "    } else if (miscW == 6.0) {\n"
+    /* PC only: a script mod's rim light (vu0.vert) */
+    "        float3 n = normalize(lerp(mul((float3x3)boneB, i.inNormal.xyz), mul((float3x3)boneA, i.inNormal.xyz), w));\n"
+    "        float3 fwd = normalize(float3(screen[3][0], screen[3][1], screen[3][2]));\n"
+    "        float edge = pow(saturate(1.0 - abs(dot(n, fwd))), 2.6);\n"
+    "        float lit = length(light.xyz) > 0.0 ? saturate(dot(n, normalize(light.xyz))) : 0.5;\n"
+    "        float a = saturate(edge * (0.35 + 0.65 * lit) * light2.w);\n"
+    "        cr = float4(saturate(light2.rgb / 255.0), a * 128.0 / 255.0);\n"
+    "        uv = float2(0.0, 0.0);\n"
     "    } else if (miscW >= 3.0) {\n"
     "        cr = saturate(floor(float4(i.inNormal.rgb, miscW == 4.0 ? color0.a : i.inNormal.a)) / 255.0);\n"
     "        uv = i.inSt.xy;\n"
@@ -478,59 +535,29 @@ static const char kVu0HlslSrc[] =
 
 static const char kVu4HlslSrc[] =
     /* vu4.vert: static geometry, screen = M * pos, colour from inColor (0..255 floats) */
-    "column_major float4x4 boneA  : register(c0);\n"  /* unused but declared to keep reg layout */
-    "column_major float4x4 boneB  : register(c4);\n"
-    "float4 pivotA : register(c8);\n"
-    "float4 pivotB : register(c9);\n"
-    "column_major float4x4 screen : register(c10);\n"
-    "float4 light  : register(c14);\n"
-    "float4 color0 : register(c15);\n"
-    "float4 color1 : register(c16);\n"
-    "float4 misc   : register(c17);\n"
-    "float4 light2 : register(c18);\n"
+    D3D9_VU_UNIFORMS_HLSL
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inColor : NORMAL; float4 inSt : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1;\n"
-    "#ifdef WRITE_DEPTH\n"
-    "    float2 depthZW : TEXCOORD2;\n"
-    "#endif\n"
-    "};\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
-    "    float4 s = mul(screen, i.inPos);\n"
-    "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
-    "    o.depth = saturate(o.pos.z / o.pos.w);\n"
-    "#ifdef WRITE_DEPTH\n"
-    "    o.depthZW = float2(o.pos.z, o.pos.w);\n"
-    "#endif\n"
+    "    vu_proj(mul(screen, i.inPos), o);\n"
     "    o.col = saturate(floor(i.inColor) / 255.0);\n"
     "    o.stq = float3(i.inSt.xy, 1.0);\n"
     "    return o;\n"
     "}\n";
 
 static const char kVu6HlslSrc[] =
-    /* vu6.vert: ground shadow; screen = M*pos; shadow UV from boneA (shadowCam)*pos */
-    "column_major float4x4 shadowCam : register(c0);\n"  /* boneA slot = shadowCam */
-    "column_major float4x4 boneB     : register(c4);\n"
-    "float4 scale    : register(c8);\n"   /* pivotA slot: scale.x */
-    "float4 texScale : register(c9);\n"  /* pivotB slot: texScale.xy */
-    "column_major float4x4 screen    : register(c10);\n"
-    "float4 light  : register(c14);\n"
-    "float4 color0 : register(c15);\n"
-    "float4 color1 : register(c16);\n"
-    "float4 misc   : register(c17);\n"
-    "float4 light2 : register(c18);\n"
+    /* vu6.vert: ground shadow; screen = M*pos; shadow UV from boneA (shadowCam)*pos, pivotA.x = scale,
+       pivotB.xy = texScale */
+    D3D9_VU_UNIFORMS_HLSL
     D3D9_VU_PROJ_HLSL
     "struct VS_IN  { float4 inPos : POSITION; float4 inColor : NORMAL; float4 unused : TEXCOORD0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float3 stq : TEXCOORD0; float depth : TEXCOORD1; };\n"
     "VS_OUT main(VS_IN i) {\n"
     "    VS_OUT o;\n"
     "    float4 p  = float4(i.inPos.xyz, 1.0);\n"
-    "    float4 s  = mul(screen,    p);\n"
-    "    float4 c  = mul(shadowCam, p);\n"
-    "    float2 st = (c.xy * scale.x + 1.0) * 0.5 * texScale.xy;\n"
-    "    o.pos = vu_proj(s.x, s.y, s.z, s.w, misc.x, misc.y, misc.z);\n"
-    "    o.depth = saturate(o.pos.z / o.pos.w);\n"
+    "    float4 c  = mul(boneA, p);\n"
+    "    float2 st = (c.xy * pivotA.x + 1.0) * 0.5 * pivotB.xy;\n"
+    "    vu_proj(mul(screen, p), o);\n"
     "    o.col = saturate(floor(i.inColor) / 255.0);\n"
     "    o.stq = float3(st, 1.0);\n"
     "    return o;\n"
@@ -561,6 +588,11 @@ static int d3d9_load_compiler(void) {
 
 static const D3D_SHADER_MACRO kD3d9WriteDepthDefine[] = {
     {"WRITE_DEPTH", "1"},
+    {NULL, NULL}
+};
+
+static const D3D_SHADER_MACRO kD3d9DepthClampDefine[] = {
+    {"DEPTH_CLAMP", "1"},
     {NULL, NULL}
 };
 
@@ -615,10 +647,39 @@ static IDirect3DPixelShader9 *d3d9_compile_ps(const char *src, const char *name)
     return d3d9_compile_ps_variant(src, name, NULL);
 }
 
+/* shaders/outline.frag: the amount to subtract from the picture where the object number of the alpha copy
+   changes. c0: x = the line's width across in uv, y = one PS2 pixel down in uv, z = darkness, w = debug view;
+   c1: x = one texel across in uv. */
 static const char kD3d9OutlinePsSrc[] =
-    "sampler2D aux : register(s0); float4 p : register(c0);"
-    "float table(float2 uv) { float id=floor(tex2D(aux,uv).r*255.0+0.5); if(id==255.0)return 0.0; float c=fmod(id*8.0,256.0); return c==0.0?128.0:c; }"
-    "float4 main(float2 uv:TEXCOORD0):COLOR0 { float h=table(uv); float r=table(uv+float2(p.x,0)); float d=table(uv+float2(0,p.y)); float l=table(uv-float2(p.x,0)); float u=table(uv-float2(0,p.y)); float e=(h>r||h>d||h>l||h>u)?p.z:0; return float4(e,e,e,0); }";
+    "sampler2D aux : register(s0);\n"
+    "float4 p : register(c0);\n"
+    "float4 q : register(c1);\n"
+    "float table(float2 uv) {\n"
+    "    float id = floor(tex2Dlod(aux, float4(uv, 0.0, 0.0)).r * 255.0 + 0.5);\n"
+    "    if (id == 255.0) return 0.0;\n"
+    "    float c = fmod(id * 8.0, 256.0);\n"
+    "    return c == 0.0 ? 128.0 : c;\n"
+    "}\n"
+    "float4 main(float2 uv : TEXCOORD0) : COLOR0 {\n"
+    "    float tx = q.x, width = p.x / tx;\n"
+    "    float here = table(uv);\n"
+    "    if (here == 0.0 && p.w == 0.0) clip(-1.0);\n"
+    "    float down = table(uv + float2(0.0, p.y)), up = table(uv - float2(0.0, p.y));\n"
+    "    float amount = (here > down || here > up) ? 1.0 : 0.0;\n"
+    "    [loop] for (int k = 1; k <= 8; k++) {\n"
+    "        if ((float)k >= width + 1.0) break;\n"
+    "        if (here > table(uv + float2(k * tx, 0.0)) || here > table(uv - float2(k * tx, 0.0))) {\n"
+    "            amount = max(amount, saturate(width - (float)k + 1.0));\n"
+    "            break;\n"
+    "        }\n"
+    "    }\n"
+    "    if (amount == 0.0 && p.w == 0.0) clip(-1.0);\n"
+    "    if (p.w != 0.0) {\n"
+    "        float id = tex2Dlod(aux, float4(uv, 0.0, 0.0)).r * 255.0;\n"
+    "        return float4(id > 254.5 ? float3(0.0, 0.0, 0.0) : float3(0.3 + id / 16.0, id == 0.0 ? 0.6 : 0.0, 0.0), 0.0);\n"
+    "    }\n"
+    "    return float4(p.z * amount, p.z * amount, p.z * amount, 0.0);\n"
+    "}\n";
 
 static void d3d9_gs_ps_init(void) {
     ID3DBlob *code = NULL, *errors = NULL;
@@ -657,22 +718,22 @@ static void d3d9_gs_ps_init(void) {
         return;
     }
     sGsPsReady = 1;
-    if (getenv("BT3_D3D9_PIXEL_DEPTH") != NULL && atoi(getenv("BT3_D3D9_PIXEL_DEPTH")) != 0) {
-        if (sVu4DepthShader != NULL) {
-            sGsPsDepth = d3d9_compile_ps_variant(kGsPsSrc, "gs_ps_depth", kD3d9WriteDepthDefine);
-            if (sGsPsDepth != NULL) {
-                sD3d9PixelDepthEnabled = 1;
-                fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth enabled (BT3_D3D9_PIXEL_DEPTH=1)\n");
-            } else {
-                fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth shader unavailable; using interpolated depth\n");
-            }
-        } else {
-            fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth vertex shader unavailable; using interpolated depth\n");
-        }
+    /* The depth-writing variant: VU geometry that crosses the camera's plane (the near-plane clamp) always,
+       and every full-depth VU4 draw with BT3_D3D9_PIXEL_DEPTH=1. */
+    sGsPsDepth = d3d9_compile_ps_variant(kGsPsSrc, "gs_ps_depth", kD3d9WriteDepthDefine);
+    if (sGsPsDepth == NULL) {
+        fprintf(stderr, "bt3: d3d9: depth-writing pixel shader unavailable; near-plane geometry is clipped\n");
+    } else if (getenv("BT3_D3D9_PIXEL_DEPTH") != NULL && atoi(getenv("BT3_D3D9_PIXEL_DEPTH")) != 0) {
+        sD3d9PixelDepthEnabled = 1;
+        fprintf(stderr, "bt3: d3d9: per-pixel VU4 depth enabled (BT3_D3D9_PIXEL_DEPTH=1)\n");
     }
     sD3d9ClutPs = d3d9_compile_ps(kD3d9ClutPsSrc, "gs_clut_ps");
     if (sD3d9ClutPs == NULL) {
         fprintf(stderr, "bt3: d3d9: native CLUT pass unavailable\n");
+    }
+    sD3d9OutlinePs = d3d9_compile_ps(kD3d9OutlinePsSrc, "outline_ps");
+    if (sD3d9OutlinePs == NULL) {
+        fprintf(stderr, "bt3: d3d9: native outline pass unavailable\n");
     }
     fprintf(stderr, "bt3: d3d9: GS pixel shader ready (ps_3_0)\n");
 }
@@ -693,14 +754,17 @@ static void d3d9_gs_ps_release(void) {
      c3 orig: xy=origSz, z=maxAlpha, w=smooth
      c4 extra: x=depth maximum, y=blendc (extra.y in GLSL), z=0, w=0 */
 static void d3d9_gs_ps_set_constants(const GsDraw *draw) {
-    float c0[4], c4[4], c5[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float c0[4], c4[4], c5[4] = {1.0f, 1.0f, 1.0f, 1.0f}, c6[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     uint32_t pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
+    const D3d9Texture *bound = (const D3d9Texture *)(uintptr_t)draw->tex;
     c0[0] = (float)draw->mode[0];
     c0[1] = (float)draw->mode[1];
     c0[2] = (float)draw->mode[2];
     c0[3] = (float)draw->mode[3];
-    c4[0] = draw->vu && draw->uniform >= 0 && (uint32_t)draw->uniform < gsVuUniCount && gsVuUni[draw->uniform].misc[2] > 0.0f
-                 ? gsVuUni[draw->uniform].misc[2] : 0.0f; /* depth max for the PS depth convention */
+    /* depth maximum for the GS whole-number depth (gs.frag extra.x) */
+    c4[0] = draw->vu ? (draw->uniform >= 0 && (uint32_t)draw->uniform < gsVuUniCount && gsVuUni[draw->uniform].misc[2] > 0.0f
+                            ? gsVuUni[draw->uniform].misc[2] : 0.0f)
+                     : gsZMax;
     c4[1] = (pipelineKey & (1u << 9)) != 0 ? 1.0f : 0.0f; /* extra.y: GS source-alpha premultiply flag */
     c4[2] = 0.0f;
     c4[3] = 0.0f;
@@ -710,6 +774,13 @@ static void d3d9_gs_ps_set_constants(const GsDraw *draw) {
         c5[2] = 1.0f / c5[0];
         c5[3] = 1.0f / c5[1];
     }
+    if (bound != NULL && bound->width > 0 && bound->height > 0) {
+        c6[0] = (float)bound->width;
+        c6[1] = (float)bound->height;
+        c6[2] = 1.0f / c6[0];
+        c6[3] = 1.0f / c6[1];
+    }
+    sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 6, c6,         1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 0, c0,         1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 1, draw->misc, 1);
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 2, draw->rect, 1);
@@ -734,8 +805,8 @@ static void d3d9_gs_ps_bind(const GsDraw *draw) {
         sDevice->lpVtbl->SetPixelShader(sDevice, NULL);
         return;
     }
-    if (sD3d9PixelDepthEnabled && draw->vu == 2 && (pipelineKey & (1u << 23)) == 0 &&
-        sGsPsDepth != NULL) {
+    if (sGsPsDepth != NULL &&
+        (sD3d9DepthPsDraw || (sD3d9PixelDepthEnabled && draw->vu == 2 && (pipelineKey & (1u << 23)) == 0))) {
         pixelShader = sGsPsDepth;
     }
     sDevice->lpVtbl->SetPixelShader(sDevice, pixelShader);
@@ -817,8 +888,10 @@ static void d3d9_vu_shaders_init(void) {
         fprintf(stderr, "bt3: d3d9: VU shader init failed; falling back to CPU transforms\n");
         return;
     }
-    if (getenv("BT3_D3D9_PIXEL_DEPTH") != NULL && atoi(getenv("BT3_D3D9_PIXEL_DEPTH")) != 0) {
-        sVu4DepthShader = d3d9_compile_vs_variant(kVu4HlslSrc, "vu4_pixel_depth", kD3d9WriteDepthDefine);
+    if (getenv("BT3_D3D9_DEPTH_CLAMP") == NULL || atoi(getenv("BT3_D3D9_DEPTH_CLAMP")) != 0) {
+        sVuClampShader[0] = d3d9_compile_vs_variant(kVu0HlslSrc, "vu0_clamp", kD3d9DepthClampDefine);
+        sVuClampShader[1] = d3d9_compile_vs_variant(kVu4HlslSrc, "vu4_clamp", kD3d9DepthClampDefine);
+        sVuClampShader[2] = d3d9_compile_vs_variant(kVu6HlslSrc, "vu6_clamp", kD3d9DepthClampDefine);
     }
     sVuDecl = d3d9_make_vu_decl();
     if (sVuDecl == NULL) return;
@@ -833,8 +906,8 @@ static void d3d9_vu_shaders_release(void) {
     d3d9_gs_ps_release();
     for (i = 0; i < 3; i++) {
         if (sVuShader[i]) { sVuShader[i]->lpVtbl->Release(sVuShader[i]); sVuShader[i] = NULL; }
+        if (sVuClampShader[i]) { sVuClampShader[i]->lpVtbl->Release(sVuClampShader[i]); sVuClampShader[i] = NULL; }
     }
-    if (sVu4DepthShader) { sVu4DepthShader->lpVtbl->Release(sVu4DepthShader); sVu4DepthShader = NULL; }
     if (sVuDecl)  { sVuDecl->lpVtbl->Release(sVuDecl);   sVuDecl  = NULL; }
     if (sVuVb)    { sVuVb->lpVtbl->Release(sVuVb);       sVuVb    = NULL; sVuVbCapacity = 0; }
     if (sVuIb)    { sVuIb->lpVtbl->Release(sVuIb);       sVuIb    = NULL; sVuIbCapacity = 0; }
@@ -909,6 +982,45 @@ static void d3d9_vu_set_constants(const Vu0Uniform *u) {
     sDevice->lpVtbl->SetVertexShaderConstantF(sDevice, 16, u->color1, 1);
     sDevice->lpVtbl->SetVertexShaderConstantF(sDevice, 17, u->misc,   1);
     sDevice->lpVtbl->SetVertexShaderConstantF(sDevice, 18, u->light2, 1);
+    sDevice->lpVtbl->SetVertexShaderConstantF(sDevice, 19, u->target, 1);
+}
+
+/* Whether a VU draw has a vertex at or behind the camera's plane (s.w <= 0), the w of its program's screen
+   transform worked out on the processor. Such a draw is the one D3D9's near-plane clipping cuts into (a stage
+   triangle under a low camera that vanished and came back as the camera moved); it is drawn with the
+   DEPTH_CLAMP shaders instead (D3D9_VU_PROJ_HLSL). Only the w row is needed: a few multiply-adds a vertex. */
+static int d3d9_vu_crosses_eye(const GsDraw *draw, const Vu0Uniform *u) {
+    const float *m = u->screen;
+    uint32_t i, end = draw->first + draw->count;
+    if (draw->vu == 1 && u->misc[3] == 2.0f) {
+        return 0; /* programs 2a / 2b: w is made positive by the shader */
+    }
+    for (i = draw->first; i < end; i++) {
+        const float *v = &gsVuVerts[(size_t)gsVuIdx[i] * 12];
+        float w;
+        if (draw->vu == 2) {
+            w = m[3] * v[0] + m[7] * v[1] + m[11] * v[2] + m[15] * v[3];
+        } else if (draw->vu == 3) {
+            w = m[3] * v[0] + m[7] * v[1] + m[11] * v[2] + m[15];
+        } else {
+            const float *a = u->boneA, *b = u->boneB;
+            float bw = u->misc[3] == 4.0f ? 1.0f : v[3];
+            float ax = v[0] - u->pivotA[0], ay = v[1] - u->pivotA[1], az = v[2] - u->pivotA[2];
+            float bx = v[0] - u->pivotB[0], by = v[1] - u->pivotB[1], bz = v[2] - u->pivotB[2];
+            float px = a[0] * ax + a[4] * ay + a[8] * az + a[12], py = a[1] * ax + a[5] * ay + a[9] * az + a[13];
+            float pz = a[2] * ax + a[6] * ay + a[10] * az + a[14];
+            float qx = b[0] * bx + b[4] * by + b[8] * bz + b[12], qy = b[1] * bx + b[5] * by + b[9] * bz + b[13];
+            float qz = b[2] * bx + b[6] * by + b[10] * bz + b[14];
+            px = qx + bw * (px - qx);
+            py = qy + bw * (py - qy);
+            pz = qz + bw * (pz - qz);
+            w = m[3] * px + m[7] * py + m[11] * pz + m[15];
+        }
+        if (!(w > 0.0f)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int d3d9_texture_size(uint32_t *width, uint32_t *height) {
@@ -1019,6 +1131,10 @@ static void d3d9_target_release(D3d9Target *target) {
     if (target->depth != NULL) {
         target->depth->lpVtbl->Release(target->depth);
         target->depth = NULL;
+    }
+    if (target->depthTex != NULL) {
+        target->depthTex->lpVtbl->Release(target->depthTex);
+        target->depthTex = NULL;
     }
     d3d9_texture_release(target->aux);
     target->aux = NULL;
@@ -1152,8 +1268,17 @@ static int d3d9_create_device(void) {
         sRgbaTextureFormat = D3DFMT_X8R8G8B8;
         fprintf(stderr, "bt3: D3D9: using X8R8G8B8 for RGB textures\n");
     }
+    sDepthIntz = getenv("BT3_D3D9_INTZ") == NULL || atoi(getenv("BT3_D3D9_INTZ")) != 0;
+    if (sDepthIntz &&
+        sD3d->lpVtbl->CheckDeviceFormat(sD3d, D3DADAPTER_DEFAULT, type, sPresent.BackBufferFormat,
+                                        D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, D3D9_FMT_INTZ) != D3D_OK) {
+        sDepthIntz = 0;
+    }
+    if (sDepthIntz) {
+        sDepthFormat = D3DFMT_D24S8; /* (INTZ is 24 + 8: the stencil of the flat shadows is there) */
+    }
     fprintf(stderr, "bt3: D3D9 depth target format %s\n",
-            sDepthFormat == D3DFMT_D32 ? "D32" : "D24S8");
+            sDepthIntz ? "INTZ (D24S8, sampled by the depth fog)" : sDepthFormat == D3DFMT_D32 ? "D32" : "D24S8");
     fprintf(stderr, "bt3: D3D9 auxiliary target format A8R8G8B8 (alpha snapshots enabled)\n");
     fprintf(stderr, "bt3: D3D9 device ready (%s vertex processing)\n",
             behavior == D3DCREATE_HARDWARE_VERTEXPROCESSING ? "hardware" : "software");
@@ -1162,6 +1287,8 @@ static int d3d9_create_device(void) {
 
 static void d3d9_draw_gs(const GsDraw *draw);
 static int d3d9_target_read(int index, uint8_t *rgba);
+static uint32_t d3d9_draw_key(const GsDraw *draw);
+static void d3d9_shadow_run_begin(int target);
 
 static int d3d9_gs_stream_ensure(uint32_t count) {
     IDirect3DVertexBuffer9 *buffer;
@@ -1389,8 +1516,30 @@ static void d3d9_frame_end(void) {
         gGsFbUploads = 0;
     }
 #endif
+    {   /* BT3_D3D9_DUMP_FRAME=<n>: the draw list of frame n on stderr (for comparing against the other back ends) */
+        static int dumpFrame = -2;
+        if (dumpFrame == -2) dumpFrame = getenv("BT3_D3D9_DUMP_FRAME") != NULL ? atoi(getenv("BT3_D3D9_DUMP_FRAME")) : -1;
+        if (dumpFrame >= 0 && (int)gGsFrame == dumpFrame) {
+            for (i = 0; i < gsDrawCount; i++) {
+                const GsDraw *d = &gsDraws[i];
+                fprintf(stderr, "d3d9-draw %u: native=%d vu=%d target=%d(fbp %03x) count=%u key=%08x tex=%p%s sampler=%d "
+                        "mode=%d,%d,%d,%d misc=%g,%g,%g,%g rect=%g,%g,%g,%g blendc=%g scissor=%d,%d,%d,%d\n",
+                        i, d->native, d->vu, d->target, d->target >= 0 ? gsTargets[d->target].fbp : 0, d->count,
+                        d3d9_draw_key(d), (void *)d->tex, d->tex_is_target ? "(target)" : "", d->sampler,
+                        d->mode[0], d->mode[1], d->mode[2], d->mode[3], d->misc[0], d->misc[1], d->misc[2], d->misc[3],
+                        d->rect[0], d->rect[1], d->rect[2], d->rect[3], d->blendc,
+                        d->scissor[0], d->scissor[1], d->scissor[2], d->scissor[3]);
+            }
+        }
+    }
     for (i = 0; i < gsDrawCount; i++) {
-        d3d9_draw_gs(&gsDraws[i]);
+        const GsDraw *d = &gsDraws[i];
+        if (!d->native && sDepthFormat == D3DFMT_D24S8 && (d3d9_draw_key(d) & (1u << 24)) != 0 &&
+            (i == 0 || gsDraws[i - 1].native || gsDraws[i - 1].target != d->target ||
+             (d3d9_draw_key(&gsDraws[i - 1]) & (1u << 24)) == 0)) {
+            d3d9_shadow_run_begin(d->target);
+        }
+        d3d9_draw_gs(d);
     }
     if (sD3d9Telemetry.enabled) {
         sD3d9Telemetry.submitNs = d3d9_now_ns() - sD3d9Telemetry.frameSubmitStartNs;
@@ -1426,9 +1575,13 @@ static void d3d9_frame_end(void) {
                 if (px != NULL && d3d9_target_read(shotTarget, px)) {
                     int y;
                     uint32_t x;
-                    char name[64];
+                    char name[600];
                     FILE *fp;
-                    snprintf(name, sizeof(name), "shots/gpu_%05u.ppm", gGsFrame);
+                    if (getenv("BT3_SHOT_DIR") != NULL) {
+                        snprintf(name, sizeof(name), "%s/gpu_%05u.ppm", getenv("BT3_SHOT_DIR"), gGsFrame);
+                    } else {
+                        snprintf(name, sizeof(name), "shots/gpu_%05u.ppm", gGsFrame);
+                    }
                     fp = fopen(name, "wb");
                     if (fp != NULL) {
                         fprintf(fp, "P6\n512 448\n255\n");
@@ -1680,6 +1833,21 @@ static void d3d9_target_ensure(int index) {
     target->aux->width = width;
     target->aux->height = height;
     target->aux->renderTarget = 1;
+    if (sDepthIntz) {
+        hr = sDevice->lpVtbl->CreateTexture(sDevice, width, height, 1, D3DUSAGE_DEPTHSTENCIL, D3D9_FMT_INTZ,
+                                             D3DPOOL_DEFAULT, &target->depthTex, NULL);
+        if (SUCCEEDED(hr)) {
+            hr = target->depthTex->lpVtbl->GetSurfaceLevel(target->depthTex, 0, &target->depth);
+        }
+        if (SUCCEEDED(hr)) {
+            return;
+        }
+        d3d9_log_hr("CreateTexture(INTZ depth)", hr);
+        if (target->depthTex != NULL) {
+            target->depthTex->lpVtbl->Release(target->depthTex);
+            target->depthTex = NULL;
+        }
+    }
     hr = sDevice->lpVtbl->CreateDepthStencilSurface(sDevice, width, height, sDepthFormat, D3DMULTISAMPLE_NONE, 0, TRUE, &target->depth, NULL);
     if (FAILED(hr)) {
         d3d9_target_release(target);
@@ -1839,8 +2007,24 @@ static void d3d9_apply_pipeline(uint32_t key, float blendConstant) {
     d3d9_set_blend_constant(blendConstant);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_DESTBLENDALPHA, D3DBLEND_ZERO);
-    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZENABLE, ztst == 0 ? D3DZB_FALSE : D3DZB_TRUE);
-    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZFUNC, ztst == 1 ? D3DCMP_ALWAYS : ztst == 2 ? D3DCMP_GREATEREQUAL : D3DCMP_GREATER);
+    /* ZTST 0 is NEVER (a draw that only writes through other means draws nothing), as the other back ends. */
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZENABLE, (key & (1u << 22)) ? D3DZB_FALSE : D3DZB_TRUE); /* (22: the table pass) */
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZFUNC, ztst == 0 ? D3DCMP_NEVER : ztst == 1 ? D3DCMP_ALWAYS :
+                                                       ztst == 2 ? D3DCMP_GREATEREQUAL : D3DCMP_GREATER);
+    /* Key bit 24: the flat shadow. One stencil bit per pixel blocks every later triangle of the same run, so
+       overlapping shadow triangles darken once (gs_gl.c set_pipe; the run's start clears it, d3d9_frame_end). */
+    if ((key & (1u << 24)) != 0 && sDepthFormat == D3DFMT_D24S8) {
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILENABLE, TRUE);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILREF, 0);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILMASK, 0xFF);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILWRITEMASK, 0xFF);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILPASS, D3DSTENCILOP_INCR);
+    } else {
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILENABLE, FALSE);
+    }
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZWRITEENABLE, zwrite != 0);
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE, wmask & 15);
     if (sD3d9MrtReady) {
@@ -1874,36 +2058,30 @@ static void d3d9_mat4_vec4(const float m[16], float x, float y, float z, float w
      gl_Position.w  = s.w
    For XYZRHW (pre-projected), we divide by s.w to get NDC then map to pixels. */
 static void d3d9_vu_project(float sx, float sy, float sz, float sw,
-                             float offx, float offy, float depthMax,
+                             float offx, float offy, float depthMax, float targetScale,
                              float vpW, float vpH,
                              float *px, float *py, float *pz, float *prhw) {
     float nx, ny, nd;
-    /* Depth-clamp emulation (see D3D9_VU_PROJ_HLSL): a vertex behind the eye is kept with a small
-       positive w and nearest depth, matching the OpenGL / SDL GPU back ends' clamped depth. */
-    float useW = sw > 0.0f ? sw : 1.0e-4f;
+    float tx = targetScale > 0.0f ? 512.0f * targetScale : 512.0f; /* (a glow work buffer at the PS2's resolution) */
+    /* (pre-transformed vertices are not clipped: one behind the eye is left out of the CPU fallback) */
+    if (sw <= 0.0f) { *px = *py = 0.0f; *pz = 0.0f; *prhw = 1.0f; return; }
     /* NDC: x in [-1,1] based on GS 512-wide space, y inverted; z in [0,1]. */
-    nx = (sx - offx * useW) / (512.0f * useW) - 1.0f;
-    ny = 1.0f - (sy - offy * useW) / (512.0f * useW);
-    if (sw <= 0.0f) {
-        /* behind the eye: nearest depth, as GL_DEPTH_CLAMP clamps NDC z below 0 to 0 (also avoids
-           dividing huge z by the tiny w, which would overflow the float range) */
-        nd = 0.0f;
-    } else if (depthMax > 0.0f) {
+    nx = (sx - offx * sw) / (tx * sw) - 1.0f;
+    ny = 1.0f - (sy - offy * sw) / (tx * sw);
+    if (depthMax > 0.0f) {
         /* depth: same as GL -- floor(s.z/s.w)+0.5 / depthMax, clamped [0,1] */
-        nd = ((float)(int)(sz / useW) + 0.5f) / depthMax;
-        if (nd < 0.0f) nd = 0.0f;
-        if (nd > 1.0f) nd = 1.0f;
+        nd = ((float)(int)(sz / sw) + 0.5f) / depthMax;
     } else {
-        nd = sz / useW;
-        if (nd < 0.0f) nd = 0.0f;
-        if (nd > 1.0f) nd = 1.0f;
+        nd = sz / (sw * -depthMax);
     }
+    if (nd < 0.0f) nd = 0.0f;
+    if (nd > 1.0f) nd = 1.0f;
     /* Convert NDC to screen pixels for XYZRHW.
        D3D9 XYZRHW: x,y are already in screen pixels (pre-divided); z is depth in [0,1]; rhw = 1/w. */
     *px = (nx + 1.0f) * 0.5f * vpW - 0.5f;
     *py = (1.0f - ny) * 0.5f * vpH - 0.5f; /* D3D9 Y=0 is top */
     *pz = nd;
-    *prhw = 1.0f / useW;
+    *prhw = 1.0f / sw;
 }
 
 #ifndef D3D9_BACKEND_PROBE
@@ -2056,7 +2234,7 @@ static unsigned d3d9_trace_clip_scissor(const float polygon[12][4], unsigned cou
 static void d3d9_trace_vu4_draw(const GsDraw *draw, const Vu0Uniform *u, uint32_t pipelineKey) {
     static uint32_t loggedFrame = UINT32_MAX;
     static uint32_t drawInFrame;
-    const char *enabled = getenv("BT3_D3D9_VU4_TRACE");
+    static int enabled = -1;
     float minX = 1.0e30f, minY = 1.0e30f, maxX = -1.0e30f, maxY = -1.0e30f;
     float minZ = 1.0e30f, maxZ = -1.0e30f, minW = 1.0e30f, maxW = -1.0e30f;
     uint32_t sideRejects[4] = {0, 0, 0, 0};
@@ -2071,7 +2249,8 @@ static void d3d9_trace_vu4_draw(const GsDraw *draw, const Vu0Uniform *u, uint32_
     float width = (float)sTargets[draw->target].color->width;
     float height = (float)sTargets[draw->target].color->height;
     float depthMax = u->misc[2];
-    if (enabled == NULL || atoi(enabled) == 0 || sD3d9Telemetry.frame % 30 != 0) return;
+    if (enabled < 0) enabled = getenv("BT3_D3D9_VU4_TRACE") != NULL && atoi(getenv("BT3_D3D9_VU4_TRACE")) != 0;
+    if (!enabled || sD3d9Telemetry.frame % 30 != 0) return;
     zEnableHr = sDevice->lpVtbl->GetRenderState(sDevice, D3DRS_ZENABLE, &actualZEnable);
     zFuncHr = sDevice->lpVtbl->GetRenderState(sDevice, D3DRS_ZFUNC, &actualZFunc);
     zWriteHr = sDevice->lpVtbl->GetRenderState(sDevice, D3DRS_ZWRITEENABLE, &actualZWrite);
@@ -2283,15 +2462,18 @@ static void d3d9_draw_vu_gpu(const GsDraw *draw) {
     if (sVuVb == NULL || sVuIb == NULL) return;
 
     pipeKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
-    /* Select shader: vu==1 → vu0, vu==2 → vu4, vu==3 → vu6. */
+    u       = &gsVuUni[draw->uniform];
+    /* Select shader: vu==1 → vu0, vu==2 → vu4, vu==3 → vu6; the depth-clamp variant for geometry that
+       crosses the camera's plane. */
     vs = sVuShader[draw->vu - 1];
-    if (draw->vu == 2 && sD3d9PixelDepthEnabled && (pipeKey & (1u << 23)) == 0 &&
-        sVu4DepthShader != NULL) {
-        vs = sVu4DepthShader;
+    sD3d9DepthPsDraw = 0;
+    if (sVuClampShader[draw->vu - 1] != NULL && sGsPsDepth != NULL && sGsPsReady && d3d9_vu_crosses_eye(draw, u)) {
+        vs = sVuClampShader[draw->vu - 1];
+        sD3d9DepthPsDraw = 1;
+        if (sD3d9Telemetry.enabled) sD3d9Telemetry.clampDraws++;
     }
     if (vs == NULL) return;
 
-    u       = &gsVuUni[draw->uniform];
     texture = d3d9_texture_from_handle(draw->tex);
 
     d3d9_set_target(draw->target);
@@ -2306,6 +2488,11 @@ static void d3d9_draw_vu_gpu(const GsDraw *draw) {
     sDevice->lpVtbl->SetStreamSource(sDevice, 0, sVuVb, 0, (UINT)D3D9_VU_STRIDE);
     sDevice->lpVtbl->SetIndices(sDevice, sVuIb);
     d3d9_vu_set_constants(u);
+    {
+        float halfPixel[4] = {1.0f / (float)sTargets[draw->target].color->width,
+                              1.0f / (float)sTargets[draw->target].color->height, 0.0f, 0.0f};
+        sDevice->lpVtbl->SetVertexShaderConstantF(sDevice, 20, halfPixel, 1);
+    }
 
     /* Texture + GS pixel shader (or fixed-function fallback when sGsPsReady == 0). */
     {
@@ -2316,6 +2503,7 @@ static void d3d9_draw_vu_gpu(const GsDraw *draw) {
         }
     }
     d3d9_gs_ps_bind(draw);
+    sD3d9DepthPsDraw = 0;
     if (!sGsPsReady) {
         d3d9_fixed_texture_stage(draw);
         d3d9_fixed_alpha_test(draw);
@@ -2488,7 +2676,7 @@ static void d3d9_draw_vu(const GsDraw *draw) {
 
         /* Project to XYZRHW screen pixels. */
         d3d9_vu_project(sx, sy, sz, sw,
-                        u->misc[0], u->misc[1], u->misc[2],
+                        u->misc[0], u->misc[1], u->misc[2], u->target[0],
                         vpW, vpH,
                         &vertices[i].x, &vertices[i].y, &vertices[i].z, &vertices[i].rhw);
         vertices[i].color = D3DCOLOR_ARGB(
@@ -2498,6 +2686,7 @@ static void d3d9_draw_vu(const GsDraw *draw) {
             (int)(cb * 255.0f + 0.5f));
         vertices[i].u = us;
         vertices[i].v = ut;
+        vertices[i].q = 1.0f;
         vertices[i].depth = vertices[i].z;
     }
 
@@ -2561,11 +2750,17 @@ static void d3d9_draw_native3(const GsDraw *draw) {
         fprintf(stderr, "bt3: d3d9: native CLUT pass has no lookup texture\n");
         return;
     }
-    if ((draw->src == 0 || sD3d9AuxCopyTarget != draw->target) &&
+    if (draw->src == 0 && target->depthTex != NULL) {
+        params[2] = 1.0f; /* the fog from the real depth (INTZ) */
+    } else if ((draw->src == 0 || sD3d9AuxCopyTarget != draw->target) &&
         !d3d9_aux_snapshot(draw->target)) {
         return;
     }
     d3d9_set_target(draw->target);
+    if (params[2] != 0.0f) {
+        /* the depth is read, so it is not bound for writing during the pass (the pass does not test it) */
+        sDevice->lpVtbl->SetDepthStencilSurface(sDevice, NULL);
+    }
     pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     d3d9_apply_pipeline(pipelineKey, draw->blendc);
     d3d9_set_scissor(draw->scissor);
@@ -2576,8 +2771,12 @@ static void d3d9_draw_native3(const GsDraw *draw) {
     sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 0, params, 1);
     sDevice->lpVtbl->SetVertexShader(sDevice, NULL);
     sDevice->lpVtbl->SetFVF(sDevice, D3D9_FVF_TEXTURED);
-    sDevice->lpVtbl->SetTexture(sDevice, 0, (IDirect3DBaseTexture9 *)sD3d9AuxCopy->texture);
-    sD3d9BoundTexture = (uintptr_t)sD3d9AuxCopy->texture;
+    {
+        IDirect3DBaseTexture9 *source = params[2] != 0.0f ? (IDirect3DBaseTexture9 *)target->depthTex
+                                                           : (IDirect3DBaseTexture9 *)sD3d9AuxCopy->texture;
+        sDevice->lpVtbl->SetTexture(sDevice, 0, source);
+        sD3d9BoundTexture = (uintptr_t)source;
+    }
     d3d9_bind_texture1(clut);
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
     sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
@@ -2600,12 +2799,113 @@ static void d3d9_draw_native3(const GsDraw *draw) {
     vertices[1].u = 1.0f; vertices[1].v = 0.0f;
     vertices[2].u = 0.0f; vertices[2].v = 1.0f;
     vertices[3].u = 1.0f; vertices[3].v = 1.0f;
+    vertices[0].q = vertices[1].q = vertices[2].q = vertices[3].q = 1.0f;
     sDevice->lpVtbl->DrawPrimitiveUP(sDevice, D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
+    if (params[2] != 0.0f) {
+        sDevice->lpVtbl->SetTexture(sDevice, 0, NULL);
+        sD3d9BoundTexture = 0;
+        sDevice->lpVtbl->SetDepthStencilSurface(sDevice, target->depth);
+    }
 
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE1,
                                      D3DCOLORWRITEENABLE_GREEN |
                                      (((pipelineKey >> 16) & GS_CC_A) ? D3DCOLORWRITEENABLE_RED : 0));
     sD3d9AppliedPipeline = UINT32_MAX;
+}
+
+static uint32_t d3d9_draw_key(const GsDraw *draw) {
+    return draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
+}
+
+/* The start of a run of flat-shadow triangles (key bit 24): the stencil they test is cleared over the whole
+   target. D3D9's Clear honours the scissor rectangle, so the test is off for it. */
+static void d3d9_shadow_run_begin(int target) {
+    if (target < 0 || target >= MAX_TARGETS || sTargets[target].color == NULL || sTargets[target].depth == NULL) {
+        return;
+    }
+    d3d9_set_target(target);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, FALSE);
+    sDevice->lpVtbl->Clear(sDevice, 0, NULL, D3DCLEAR_STENCIL, 0, 0.0f, 0);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
+    sD3d9ScissorValid = 0;
+}
+
+/* Native effect 1: the outline (shaders/outline.frag), from the copy of the alpha ids the game's own pass took
+   (native 4, sD3d9AuxCopy). The result is subtracted from the picture's colour; alpha and the ids stay. */
+static void d3d9_draw_outline(const GsDraw *draw) {
+    extern int Port_PageAspectMilli(void);
+    D3d9Target *target;
+    D3d9Vertex vertices[4];
+    float params[8];
+    float width, height;
+    if (sD3d9OutlinePs == NULL || sD3d9AuxCopy == NULL || sD3d9AuxCopy->texture == NULL ||
+        draw->target < 0 || draw->target >= MAX_TARGETS || sTargets[draw->target].color == NULL ||
+#ifndef D3D9_BACKEND_PROBE
+        !gsTargets[draw->target].cleared ||
+#endif
+        sTargets[draw->target].color->surface == NULL) {
+        return;
+    }
+    target = &sTargets[draw->target];
+    d3d9_set_target(draw->target);
+    d3d9_set_scissor(draw->scissor);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZENABLE, D3DZB_FALSE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ZWRITEENABLE, FALSE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_STENCILENABLE, FALSE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ALPHATESTENABLE, FALSE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_ALPHABLENDENABLE, TRUE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SRCBLEND, D3DBLEND_ONE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_DESTBLEND, D3DBLEND_ONE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_BLENDOP, D3DBLENDOP_REVSUBTRACT);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_DESTBLENDALPHA, D3DBLEND_ZERO);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE,
+                                     D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
+    if (sD3d9MrtReady) {
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE1, 0);
+    }
+    params[0] = 1333.333f / (float)Port_PageAspectMilli() / (float)GS_W; /* one PS2 pixel across, as wide as at 4:3 */
+    params[1] = 1.0f / (float)GS_H;
+    params[2] = 100.0f / 255.0f;
+    params[3] = getenv("BT3_FX_DEBUG") != NULL ? 1.0f : 0.0f;
+    params[4] = 1.0f / (float)sD3d9AuxCopy->width;
+    params[5] = params[6] = params[7] = 0.0f;
+    sDevice->lpVtbl->SetPixelShader(sDevice, sD3d9OutlinePs);
+    sDevice->lpVtbl->SetPixelShaderConstantF(sDevice, 0, params, 2);
+    sDevice->lpVtbl->SetVertexShader(sDevice, NULL);
+    sDevice->lpVtbl->SetFVF(sDevice, D3D9_FVF_TEXTURED);
+    sDevice->lpVtbl->SetTexture(sDevice, 0, (IDirect3DBaseTexture9 *)sD3d9AuxCopy->texture);
+    sD3d9BoundTexture = (uintptr_t)sD3d9AuxCopy->texture;
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    sDevice->lpVtbl->SetSamplerState(sDevice, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
+
+    width = (float)target->color->width;
+    height = (float)target->color->height;
+    memset(vertices, 0, sizeof(vertices));
+    vertices[0].x = -0.5f;         vertices[0].y = -0.5f;
+    vertices[1].x = width - 0.5f;  vertices[1].y = -0.5f;
+    vertices[2].x = -0.5f;         vertices[2].y = height - 0.5f;
+    vertices[3].x = width - 0.5f;  vertices[3].y = height - 0.5f;
+    vertices[0].u = 0.0f; vertices[0].v = 0.0f;
+    vertices[1].u = 1.0f; vertices[1].v = 0.0f;
+    vertices[2].u = 0.0f; vertices[2].v = 1.0f;
+    vertices[3].u = 1.0f; vertices[3].v = 1.0f;
+    {
+        int k;
+        for (k = 0; k < 4; k++) {
+            vertices[k].rhw = 1.0f;
+            vertices[k].q = 1.0f;
+            vertices[k].color = 0xFFFFFFFFu;
+        }
+    }
+    sDevice->lpVtbl->DrawPrimitiveUP(sDevice, D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(vertices[0]));
+    sD3d9AppliedPipeline = UINT32_MAX; /* every state above is the pipeline's again for the next draw */
 }
 
 static void d3d9_draw_gs(const GsDraw *draw) {
@@ -2664,6 +2964,10 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         d3d9_draw_native3(draw);
         return;
     }
+    if (draw->native == 1) {
+        d3d9_draw_outline(draw);
+        return;
+    }
     if (draw->native || draw->target < 0 || draw->target >= MAX_TARGETS || count == 0) {
         return;
     }
@@ -2700,8 +3004,16 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         vertices[i].z = source->z;
         vertices[i].rhw = 1.0f;
         vertices[i].color = D3DCOLOR_ARGB(av, source->r, source->g, source->b);
-        vertices[i].u = source->s;
-        vertices[i].v = source->t;
+        if (sGsPsReady) {
+            vertices[i].u = source->s;
+            vertices[i].v = source->t;
+            vertices[i].q = source->q != 0.0f ? source->q : 1.0f;
+        } else { /* (the fixed-function stage does not divide: s / q here, linear between the vertices) */
+            float q = source->q != 0.0f ? source->q : 1.0f;
+            vertices[i].u = source->s / q;
+            vertices[i].v = source->t / q;
+            vertices[i].q = 1.0f;
+        }
         vertices[i].depth = source->z;
     }
     if (!d3d9_gs_stream_ensure(count)) {
