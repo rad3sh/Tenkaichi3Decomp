@@ -1522,6 +1522,54 @@ static void d3d9_frame_end(void) {
         if (dumpFrame >= 0 && (int)gGsFrame == dumpFrame) {
             for (i = 0; i < gsDrawCount; i++) {
                 const GsDraw *d = &gsDraws[i];
+                const D3d9Texture *t = (const D3d9Texture *)(uintptr_t)d->tex;
+                float bb[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                uint32_t k;
+                if (!d->native && !d->vu && d->count > 0) {
+                    const Vtx *v = &gsVerts[d->first];
+                    bb[0] = bb[2] = v[0].x; bb[1] = bb[3] = v[0].y;
+                    for (k = 1; k < d->count; k++) {
+                        if (v[k].x < bb[0]) bb[0] = v[k].x;
+                        if (v[k].y < bb[1]) bb[1] = v[k].y;
+                        if (v[k].x > bb[2]) bb[2] = v[k].x;
+                        if (v[k].y > bb[3]) bb[3] = v[k].y;
+                    }
+                }
+                if (getenv("BT3_D3D9_DUMP_VERTS") != NULL && (int)i == atoi(getenv("BT3_D3D9_DUMP_VERTS")) && !d->native && !d->vu) {
+                    for (k = 0; k < d->count; k++) {
+                        const Vtx *v = &gsVerts[d->first + k];
+                        fprintf(stderr, "  v%u: %g,%g z=%g st=%g,%g q=%g rgba=%02x%02x%02x%02x\n", k, v->x, v->y, v->z, v->s, v->t, v->q,
+                                v->r, v->g, v->b, v->a);
+                    }
+                    if (t != NULL && t->texture != NULL && !t->renderTarget && t->format == GS_TEXFMT_RGBA8) {
+                        D3DLOCKED_RECT lr; /* its texture as a PPM of the colour and one of the alpha */
+                        if (SUCCEEDED(t->texture->lpVtbl->LockRect(t->texture, 0, &lr, NULL, D3DLOCK_READONLY))) {
+                            FILE *fc = fopen("d3d9_dump_rgb.ppm", "wb"), *fa = fopen("d3d9_dump_alpha.ppm", "wb");
+                            uint32_t x, y;
+                            if (fc != NULL && fa != NULL) {
+                                fprintf(fc, "P6\n%u %u\n255\n", t->width, t->height);
+                                fprintf(fa, "P6\n%u %u\n255\n", t->width, t->height);
+                                for (y = 0; y < t->height; y++) {
+                                    const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+                                    for (x = 0; x < t->width; x++) {
+                                        uint8_t c[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0]}, a3[3];
+                                        a3[0] = a3[1] = a3[2] = row[x * 4 + 3];
+                                        fwrite(c, 1, 3, fc);
+                                        fwrite(a3, 1, 3, fa);
+                                    }
+                                }
+                            }
+                            if (fc != NULL) fclose(fc);
+                            if (fa != NULL) fclose(fa);
+                            t->texture->lpVtbl->UnlockRect(t->texture, 0);
+                        }
+                    }
+                }
+                fprintf(stderr, "d3d9-draw %u: bbox=%g,%g..%g,%g texsize=%ux%u q0=%g col0=%02x%02x%02x%02x\n", i, bb[0], bb[1], bb[2], bb[3],
+                        t != NULL ? t->width : 0, t != NULL ? t->height : 0,
+                        !d->native && !d->vu && d->count ? gsVerts[d->first].q : 0.0f,
+                        !d->native && !d->vu && d->count ? gsVerts[d->first].r : 0, !d->native && !d->vu && d->count ? gsVerts[d->first].g : 0,
+                        !d->native && !d->vu && d->count ? gsVerts[d->first].b : 0, !d->native && !d->vu && d->count ? gsVerts[d->first].a : 0);
                 fprintf(stderr, "d3d9-draw %u: native=%d vu=%d target=%d(fbp %03x) count=%u key=%08x tex=%p%s sampler=%d "
                         "mode=%d,%d,%d,%d misc=%g,%g,%g,%g rect=%g,%g,%g,%g blendc=%g scissor=%d,%d,%d,%d\n",
                         i, d->native, d->vu, d->target, d->target >= 0 ? gsTargets[d->target].fbp : 0, d->count,
@@ -1697,6 +1745,11 @@ static int d3d9_tex_upload(GsTex handle, int level, uint32_t width, uint32_t hei
     uint64_t uploadStart = d3d9_now_ns();
     if (texture == NULL || texture->texture == NULL || pixels == NULL || level < 0 || level >= 16 ||
         width == 0 || height == 0 || width > texture->width || height > texture->height) {
+        static int logged;
+        if (logged++ < 8) {
+            fprintf(stderr, "bt3: d3d9: texture upload refused (%ux%u level %d into %ux%u)\n", width, height, level,
+                    texture != NULL ? texture->width : 0, texture != NULL ? texture->height : 0);
+        }
         free(ownedPixels);
         return 0;
     }
@@ -1742,15 +1795,16 @@ static int d3d9_fb_upload_texture(int index) {
     }
     texture = sFbTex[index];
     if (texture == NULL) {
+        /* A lockable default-pool surface: StretchRect (native 100 / 101) refuses a managed texture's surface as
+           its source, which left the movies black. */
         texture = (D3d9Texture *)calloc(1, sizeof(*texture));
-        if (texture == NULL || FAILED(sDevice->lpVtbl->CreateTexture(sDevice, GS_W, GS_H, 1, 0, D3DFMT_A8R8G8B8,
-                                                                      D3DPOOL_MANAGED, &texture->texture, NULL)) ||
-            FAILED(texture->texture->lpVtbl->GetSurfaceLevel(texture->texture, 0, &texture->surface))) {
+        if (texture == NULL || FAILED(sDevice->lpVtbl->CreateOffscreenPlainSurface(sDevice, GS_W, GS_H, D3DFMT_A8R8G8B8,
+                                                                                   D3DPOOL_DEFAULT, &texture->surface, NULL))) {
             if (texture != NULL) {
                 if (texture->surface != NULL) texture->surface->lpVtbl->Release(texture->surface);
-                if (texture->texture != NULL) texture->texture->lpVtbl->Release(texture->texture);
                 free(texture);
             }
+            fprintf(stderr, "bt3: d3d9: cannot make the display buffer surface for the movies\n");
             return 0;
         }
         texture->width = GS_W;
@@ -1758,7 +1812,7 @@ static int d3d9_fb_upload_texture(int index) {
         texture->format = GS_TEXFMT_RGBA8;
         sFbTex[index] = texture;
     }
-    if (FAILED(texture->texture->lpVtbl->LockRect(texture->texture, 0, &locked, NULL, 0))) {
+    if (FAILED(texture->surface->lpVtbl->LockRect(texture->surface, &locked, NULL, 0))) {
         return 0;
     }
     pixels = (uint32_t *)locked.pBits;
@@ -1769,7 +1823,7 @@ static int d3d9_fb_upload_texture(int index) {
                                                   ((c & 0x00FF0000u) >> 16) | (c & 0xFF000000u);
         }
     }
-    texture->texture->lpVtbl->UnlockRect(texture->texture, 0);
+    texture->surface->lpVtbl->UnlockRect(texture->surface);
     return 1;
 }
 #endif
@@ -3001,7 +3055,9 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         }
         vertices[i].x = source->x * (float)SCALE - 0.5f;
         vertices[i].y = source->y * (float)SCALE - 0.5f;
-        vertices[i].z = source->z;
+        /* Pre-transformed vertices outside the depth range are clipped by D3D9; the other back ends clamp the depth
+           (GL_DEPTH_CLAMP, no depth clipping in SDL GPU). The game's own font glyphs come with z far above 1. */
+        vertices[i].z = source->z < 0.0f ? 0.0f : source->z > 1.0f ? 1.0f : source->z;
         vertices[i].rhw = 1.0f;
         vertices[i].color = D3DCOLOR_ARGB(av, source->r, source->g, source->b);
         if (sGsPsReady) {
@@ -3014,7 +3070,7 @@ static void d3d9_draw_gs(const GsDraw *draw) {
             vertices[i].v = source->t / q;
             vertices[i].q = 1.0f;
         }
-        vertices[i].depth = source->z;
+        vertices[i].depth = vertices[i].z;
     }
     if (!d3d9_gs_stream_ensure(count)) {
         free(vertices);

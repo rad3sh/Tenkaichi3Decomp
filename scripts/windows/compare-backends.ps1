@@ -9,7 +9,7 @@ param(
     [int]$From = 0,
     [int]$To = 0,
     [int]$Scale = 1,
-    # Extra environment for every run, as NAME=VALUE (for example BT3_CHARA=13).
+    # Extra environment for every run, as NAME=VALUE (for example BT3_CHARA=13; several separated by ';').
     [string[]]$Env = @(),
     # Run the real menus instead of the attract-demo battle (BT3_DEMO=1).
     [switch]$Menu,
@@ -23,7 +23,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # (-File passes a list as one string: 'gl,d3d9')
 $Backends = @($Backends | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
-$Env = @($Env | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$Env = @($Env | ForEach-Object { $_ -split ';' } | Where-Object { $_ }) # (';' between several: BT3_PAD takes commas)
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $buildDir = Join-Path $repoRoot 'port\build'
