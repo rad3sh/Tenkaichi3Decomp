@@ -1867,8 +1867,8 @@ static void d3d9_frame_end(void) {
         hr = sDevice->lpVtbl->Present(sDevice, shown.right > 0 && shown.bottom > 0 ? &shown : NULL, NULL, NULL, NULL);
         if (sD3d9Telemetry.enabled) sD3d9Telemetry.presentNs = d3d9_now_ns() - presentStart;
     }
-    /* BT3_SHOT=<n>: every n frames, write the shown buffer's picture (512 x 448 RGBA) as a PPM, as the
-       OpenGL and SDL GPU back ends do (port/build/shots/gpu_NNNNN.ppm). */
+    /* BT3_SHOT=<n>: every n frames, write the shown buffer's picture as a PPM, as the OpenGL and SDL GPU back ends do
+       (shots/gpu_NNNNN.ppm from the working folder, or BT3_SHOT_DIR). */
     {
         static int every = -1;
         if (every < 0) { every = getenv("BT3_SHOT") != NULL ? atoi(getenv("BT3_SHOT")) : 0; }
@@ -1881,10 +1881,17 @@ static void d3d9_frame_end(void) {
                 (int)gGsFrame % every == 0 &&
                 (getenv("BT3_SHOT_FROM") == NULL || (int)gGsFrame >= atoi(getenv("BT3_SHOT_FROM"))) &&
                 (getenv("BT3_SHOT_TO") == NULL || (int)gGsFrame <= atoi(getenv("BT3_SHOT_TO")))) {
-                uint8_t *px = malloc(512 * 448 * 4);
-                if (px != NULL && d3d9_target_read(shotTarget, px)) {
-                    int y;
-                    uint32_t x;
+                /* at the internal resolution, as the OpenGL back end writes it (512 x 448 times SCALE) */
+                IDirect3DSurface9 *staging = NULL;
+                D3DLOCKED_RECT lr;
+                uint32_t w = 512u * (uint32_t)SCALE, h = 448u * (uint32_t)SCALE;
+                if (sTargets[shotTarget].color != NULL &&
+                    SUCCEEDED(sDevice->lpVtbl->CreateOffscreenPlainSurface(sDevice, sTargets[shotTarget].color->width,
+                                                                            sTargets[shotTarget].color->height, D3DFMT_A8R8G8B8,
+                                                                            D3DPOOL_SYSTEMMEM, &staging, NULL)) &&
+                    SUCCEEDED(sDevice->lpVtbl->GetRenderTargetData(sDevice, sTargets[shotTarget].color->surface, staging)) &&
+                    SUCCEEDED(staging->lpVtbl->LockRect(staging, &lr, NULL, D3DLOCK_READONLY))) {
+                    uint32_t x, y;
                     char name[600];
                     FILE *fp;
                     if (getenv("BT3_SHOT_DIR") != NULL) {
@@ -1894,16 +1901,25 @@ static void d3d9_frame_end(void) {
                     }
                     fp = fopen(name, "wb");
                     if (fp != NULL) {
-                        fprintf(fp, "P6\n512 448\n255\n");
-                        for (y = 0; y < 448; y++) {
-                            for (x = 0; x < 512; x++) {
-                                fwrite(&px[(y * 512 + x) * 4], 1, 3, fp);
+                        uint8_t *row = (uint8_t *)malloc((size_t)w * 3);
+                        fprintf(fp, "P6\n%u %u\n255\n", w, h);
+                        for (y = 0; row != NULL && y < h; y++) {
+                            const uint8_t *src = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+                            for (x = 0; x < w; x++) {
+                                row[x * 3 + 0] = src[x * 4 + 2];
+                                row[x * 3 + 1] = src[x * 4 + 1];
+                                row[x * 3 + 2] = src[x * 4 + 0];
                             }
+                            fwrite(row, 1, (size_t)w * 3, fp);
                         }
+                        free(row);
                         fclose(fp);
                     }
+                    staging->lpVtbl->UnlockRect(staging);
                 }
-                free(px);
+                if (staging != NULL) {
+                    staging->lpVtbl->Release(staging);
+                }
             }
         }
     }
