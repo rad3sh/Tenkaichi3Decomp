@@ -84,6 +84,8 @@ extern int gPortChatTyping;    /* a line of the online chat is being typed: the 
 /* ui.cpp */
 int Ui_Init(SDL_Window *window, SDL_GPUDevice *device, void *gl_context, const char *gpu_name); /* device: the SDL GPU back end; NULL and a GL context: the OpenGL one */
 void Ui_DrawGL(void); /* the OpenGL back end: draws this frame's window with the context current */
+int Ui_InitD3D9(SDL_Window *window, void *device, const char *gpu_name); /* the Direct3D 9 back end: its IDirect3DDevice9 */
+void Ui_D3D9Lost(int lost); /* the Direct3D 9 device is about to be reset (1) / was reset (0) */
 int Ui_Event(const SDL_Event *ev); /* 1 = the window used the event */
 int GsDraw_FrameSkip(void);       /* gs_draw.c */
 void GsDraw_FrameSkipSet(int on);

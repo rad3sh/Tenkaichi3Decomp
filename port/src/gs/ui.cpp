@@ -12,6 +12,9 @@
 #include "imgui_impl_sdl3.h"
 #include "imgui_impl_sdlgpu3.h"
 #include "imgui_impl_opengl3.h"
+#ifdef _WIN32
+#include "imgui_impl_dx9.h"
+#endif
 #include "ui.h"
 #include "namefont.h"
 #include "../port_release.h"
@@ -24,7 +27,9 @@
 
 static int sMeter = -1; // the meter (frame rate, connection): -1 not read yet
 static bool meter_on(void);
-static int sGL; // 1: the OpenGL back end draws the window (ImGui's OpenGL3 backend, no SDL GPU device)
+static int sGL; // 1: no SDL GPU device: the OpenGL or the Direct3D 9 back end draws the window (ImGui's OpenGL3 / DX9 backend)
+static int sD3D9; // 1: the Direct3D 9 one (with sGL); a texture of this file is then an IDirect3DTexture9 *
+static void *sD3d9Device; // what Ui_InitD3D9 was given
 static char sGpuName[256];
 
 extern "C" {
@@ -61,6 +66,8 @@ extern unsigned gPortLiveBlanks;               // plat_stub.c: vertical blanks t
 int Port_RollCan(void);                        // gs/state.c
 const char *Port_FileRoot(void);               // plat_file.c: the game's data folder
 unsigned GsGl_StripTexture(const void *rgba, int w, int h); // gs_gl.c
+void *GsD3d9_StripTexture(const void *rgba, int w, int h);   // gs_d3d9.c
+void GsD3d9_StripTextureFree(void *texture);
 void GsGl_StripTextureFree(unsigned id);
 const char *PortStages_Dir(void);                          // plat_stages.c
 const char *PortStages_Name(int index);
@@ -176,6 +183,13 @@ static SDL_GPUTexture *make_strip(uint8_t *pix, size_t bytes, uint32_t w, uint32
     SDL_GPUTexture *tex;
     void *map;
 
+#ifdef _WIN32
+    if (sD3D9) { // the Direct3D 9 back end: the texture is the id ImGui's DX9 backend takes
+        void *t = GsD3d9_StripTexture(pix, (int)w, (int)(h * count));
+        free(pix);
+        return (SDL_GPUTexture *)t;
+    }
+#endif
     if (sGL) { // the OpenGL back end: a GL texture, its name carried in the pointer (ImGui's OpenGL3 backend takes it so)
         unsigned id = GsGl_StripTexture(pix, (int)w, (int)(h * count));
         free(pix);
@@ -311,7 +325,11 @@ void Ui_TextureFree(SDL_GPUTexture *tex) {
     if (tex == NULL) {
         return;
     }
-    if (sGL) {
+    if (sD3D9) {
+#ifdef _WIN32
+        GsD3d9_StripTextureFree((void *)tex);
+#endif
+    } else if (sGL) {
         GsGl_StripTextureFree((unsigned)(intptr_t)tex);
     } else {
         SDL_ReleaseGPUTexture(sDevice, tex);
@@ -567,7 +585,17 @@ int Ui_Init(SDL_Window *window, SDL_GPUDevice *device, void *gl_context, const c
             pf.font = panel_font_load(pf.choice);
         }
     }
-    if (device == NULL) { // the OpenGL back end (gs_gl.c), with its context current
+    if (device == NULL && sD3d9Device != NULL) { // the Direct3D 9 back end (gs_d3d9.c)
+        sGL = 1;
+        sD3D9 = 1;
+#ifdef _WIN32
+        if (!ImGui_ImplSDL3_InitForD3D(window) || !ImGui_ImplDX9_Init((IDirect3DDevice9 *)sD3d9Device)) {
+            return 0;
+        }
+#else
+        return 0;
+#endif
+    } else if (device == NULL) { // the OpenGL back end (gs_gl.c), with its context current
         sGL = 1;
         if (!ImGui_ImplSDL3_InitForOpenGL(window, (SDL_GLContext)gl_context) || !ImGui_ImplOpenGL3_Init("#version 330 core")) {
             return 0;
@@ -1387,20 +1415,34 @@ static void video_tab(PortVideo &v) {
     }
     ImGui::SetItemTooltip("Takes effect the next time the game starts.");
     SDL_free(displays);
-    {   // which renderer draws the game: Vulkan (the default) or OpenGL 3.3, for machines without a working Vulkan
+    {   // which renderer draws the game: Vulkan (the default), OpenGL 3.3 for machines without a working Vulkan, or
+        // (Windows) Direct3D 9 for older cards. The combo's index i is the setting kValue[i] (gpu_api 3: Direct3D 9).
+#ifdef _WIN32
+        static const char *const kApi[] = {"Vulkan", "OpenGL", "Direct3D 9 (older graphics cards)"};
+        static const int kValue[] = {0, 1, 3};
+        const int kCount = 3;
+#else
         static const char *const kApi[] = {"Vulkan", "OpenGL"};
+        static const int kValue[] = {0, 1};
+        const int kCount = 2;
+#endif
         static int api = -1;
+        const int running = sD3D9 ? 2 : sGL ? 1 : 0;
         if (api < 0) {
-            api = Port_Setting("gpu_api", 0) == 1 ? 1 : 0;
+            int saved = Port_Setting("gpu_api", 0);
+            api = 0;
+            for (int i = 0; i < kCount; i++) {
+                if (kValue[i] == saved) { api = i; }
+            }
         }
-        if (ImGui::Combo("Renderer", &api, kApi, 2)) {
-            Port_SettingSave("gpu_api", api);
+        if (ImGui::Combo("Renderer", &api, kApi, kCount)) {
+            Port_SettingSave("gpu_api", kValue[api]);
             Port_SettingsWrite();
         }
-        ImGui::SetItemTooltip("Takes effect the next time the game starts. Both draw the same picture; Vulkan is faster.\n"
-                              "If the chosen one cannot start, the game tries the other.");
-        if (api != (sGL ? 1 : 0)) {
-            ImGui::TextDisabled("Running now: %s. %s from the next start.", kApi[sGL ? 1 : 0], kApi[api]);
+        ImGui::SetItemTooltip("Takes effect the next time the game starts. All draw the same picture; Vulkan is faster.\n"
+                              "If the chosen one cannot start, the game tries another.");
+        if (api != running) {
+            ImGui::TextDisabled("Running now: %s. %s from the next start.", kApi[running], kApi[api]);
         }
         ImGui::TextWrapped("Active GPU: %s", sGpuName);
     }
@@ -2676,7 +2718,11 @@ static const FontName *font_name(int style, const char *text) {
     }
     FontName &n = sFontNames[sFontNext++ % (sizeof(sFontNames) / sizeof(sFontNames[0]))];
     if (n.used && n.tex != NULL) {
-        if (sGL) {
+        if (sD3D9) {
+#ifdef _WIN32
+            GsD3d9_StripTextureFree((void *)n.tex);
+#endif
+        } else if (sGL) {
             GsGl_StripTextureFree((unsigned)(intptr_t)n.tex);
         } else {
             SDL_ReleaseGPUTexture(sDevice, n.tex);
@@ -2988,7 +3034,11 @@ static bool frame_build(void) {
         ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     }
     sBuilt = true;
-    if (sGL) {
+    if (sD3D9) {
+#ifdef _WIN32
+        ImGui_ImplDX9_NewFrame();
+#endif
+    } else if (sGL) {
         ImGui_ImplOpenGL3_NewFrame();
     } else {
         ImGui_ImplSDLGPU3_NewFrame();
@@ -3144,6 +3194,34 @@ void Ui_Draw(SDL_GPUCommandBuffer *cmd, SDL_GPUTexture *target) {
 // The OpenGL back end's turn: over the presented picture, just before the buffers are swapped.
 void Ui_DrawGL(void) {
     if (sGL && frame_build()) {
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        if (sD3D9) {
+#ifdef _WIN32
+            ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+#endif
+        } else {
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        }
     }
+}
+
+// The Direct3D 9 back end's: its device, between BeginScene and EndScene with the window's back buffer bound
+// when Ui_DrawGL is called.
+int Ui_InitD3D9(SDL_Window *window, void *device, const char *gpu_name) {
+    sD3d9Device = device;
+    return Ui_Init(window, NULL, NULL, gpu_name);
+}
+
+// Before the Direct3D 9 device is reset (and after): its default-pool objects are made again.
+void Ui_D3D9Lost(int lost) {
+#ifdef _WIN32
+    if (sD3D9 && sReady) {
+        if (lost) {
+            ImGui_ImplDX9_InvalidateDeviceObjects();
+        } else {
+            ImGui_ImplDX9_CreateDeviceObjects();
+        }
+    }
+#else
+    (void)lost;
+#endif
 }

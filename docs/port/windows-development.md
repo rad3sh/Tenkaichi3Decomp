@@ -68,9 +68,7 @@ $env:_NT_SYMBOL_PATH = "srv*C:\symbols*https://msdl.microsoft.com/download/symbo
 The `logs/` directory is local state and should not be committed. The scripts create it automatically.
 
 The default D3D9/game window starts at `640x480`, a compact size close to the PS2 picture. Use
-`BT3_WINDOW=WxH` to request another size, for example `BT3_WINDOW=1024x896`. The experimental D3D9 GS
-pixel shader is disabled by default while its alpha/composition behavior is being matched; enable it for testing
-with `BT3_D3D9_PIXEL_SHADER=1`.
+`BT3_WINDOW=WxH` to request another size, for example `BT3_WINDOW=1024x896`.
 The visual backend probe also writes `build/windows/d3d9_backend_probe.ppm` and validates the PPM source pixels,
 RGBA8 upload, DXT1 upload, target readback, and target copy. It is run with:
 
@@ -78,9 +76,29 @@ RGBA8 upload, DXT1 upload, target readback, and target copy. It is run with:
 .\scripts\windows\run-d3d9-backend-probe.ps1 -Architecture x64
 ```
 
+## Comparing the D3D9 picture with OpenGL
+
+`scripts/windows/compare-backends.ps1` runs the game once per back end with screenshots every n frames
+(`BT3_SHOT`, `BT3_SHOT_DIR`), stops each run after a time, and writes `side_<backend>_NNNNN.png` (reference |
+backend | amplified difference) under `build/windows/compare/`, with the mean difference per frame. The
+attract-demo battle (`BT3_DEMO=1`, the default) is deterministic frame by frame, so the same frame shows the same
+scene in every back end:
+
+```powershell
+.\scripts\windows\build-port-win64.ps1
+.\scripts\windows\compare-backends.ps1 -Backends gl,d3d9 -Seconds 50 -Every 150
+# the menus and a versus fight, without a controller: scripted presses (BT3_PAD) from the versus menu
+$pad = ((0..7 | % { "$(650 + $_*60):start" }) + (0..50 | % { "$(1150 + $_*45):cross" })) -join ','
+.\scripts\windows\compare-backends.ps1 -Menu -Seconds 90 -Every 90 -Env "BT3_MENU_MODE=38;BT3_PAD=$pad" -OutDir build\windows\menu
+python scripts\windows\contact_sheet.py build\windows\menu\d3d9 build\windows\menu\sheet.png
+```
+
+`BT3_D3D9_DUMP_FRAME=<frame>` prints that frame's draw list (target, pipeline key, texture, bounding box) and
+`BT3_D3D9_DUMP_VERTS=<draw>` one draw's vertices and texture, to find the draw behind a difference.
+
 ## Current scope
 
-This branch prepares the Windows CLI environment and the first native D3D9 backend path. The existing Linux/macOS
-build remains unchanged. The renderer uses the same MSVC/Windows SDK environment and preserves the existing
-Vulkan/OpenGL backends. It supports RGBA8 and DXT1/DXT3/DXT5 texture upload paths and target readback probes; the
-full game build and VU shader path are still pending.
+This branch adds the Windows CLI environment and the native D3D9 back end (`port/src/gs/gs_d3d9.c`, see
+docs/port/README.md, "The Direct3D 9 back end"). It draws the same pictures as the OpenGL back end in the
+compared scenes (title movie, menus, the demo battle, a versus fight with its HUD) and has the settings window
+(F1). The existing Linux/macOS build remains unchanged.

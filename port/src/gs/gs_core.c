@@ -1422,6 +1422,13 @@ static int render_thread_wanted(void) {
     if (want && e == NULL && (Port_Setting("gpu_api", 0) == 1 || SDL_GetNumLogicalCPUCores() <= 2)) {
         want = 0;
     }
+    {   /* Direct3D 9 (BT3_GPU_API=d3d9, or the Renderer setting 3): the device is the game thread's */
+        const char *api = getenv("BT3_GPU_API");
+        if ((api != NULL && strcmp(api, "d3d9") == 0) ||
+            ((api == NULL || strcmp(api, "auto") == 0) && Port_Setting("gpu_api", 0) == 3)) {
+            want = 0;
+        }
+    }
     return want;
 }
 

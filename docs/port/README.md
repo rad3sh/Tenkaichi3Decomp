@@ -450,49 +450,41 @@ Missing on purpose until their native versions exist, so the GPU picture is brig
 sharper than the reference's: depth tint, glare, the intro's fade, any blur.
 Speed is unchanged (about half real time): see the profile above, not addressed yet.
 
-The D3D9 backend now binds native pass 3 (the depth/alpha CLUT pass) end to end. Its auxiliary
-render target stores the GS alpha byte in R and projected depth in G; native pass 4 snapshots
-that target, and pass 3 samples the snapshot or current depth channel plus the 256-entry CLUT,
-respecting the recorded scissor and pipeline. D3D9 cannot sample its D24S8 surface directly, so
-the fog source uses the normalized depth interpolant captured by the pixel shader; this is an
-approximation, not a bit-exact read of PS2 depth memory. The Windows D3D9 backend probe checks
-both CLUT sources and the scissor boundary. It also checks GS alpha tests at the 0x7F/0x80 edge:
-the D3D9 vertex path keeps RGBAQ alpha raw and applies the GS 255/128 scale once. Other PS2
-memory-view passes remain unsupported.
+### The Direct3D 9 back end (Windows, `BT3_GPU_API=d3d9` or F1 > Video > Renderer)
 
-D3D9 also snapshots the auxiliary alpha channel for native pass 5 and applies the GS destination-alpha
-test in its pixel shader. This is required by some stage layers as well as HUD masks. The presenter
-selects the GS main framebuffer rather than whichever offscreen target happened to receive the last
-draw, and target clear state follows the shared target table so a recycled target is initialized.
+`port/src/gs/gs_d3d9.c` replays the same draw list as the SDL GPU and OpenGL back ends, for graphics cards
+without a working Vulkan or OpenGL 3.3 (tested: GeForce GT 610). Its pictures are compared against the OpenGL
+back end's frame by frame with `scripts/windows/compare-backends.ps1` (the attract-demo battle, or the menus and
+a fight through a `BT3_PAD` script, `BT3_MENU_MODE=38`): fewer than 0.05% of the pixels differ (2026-11-25).
 
-D3D9 selects D32 only when the adapter reports a compatible depth-stencil match; the tested
-GeForce GT 610 reports D24S8, so D32 is not available there.
-The terrain edge disappearing near the camera was D3D9 clipping primitives at the near plane
-(w <= 0): the OpenGL back end keeps them with `glEnable(GL_DEPTH_CLAMP)` and the SDL GPU one
-has depth clipping off by default, so stage triangles that crossed the near plane (the ground
-under a low camera) vanished only there and came and went with the camera's movement. The VU
-shader projection (`D3D9_VU_PROJ_HLSL` and the CPU `d3d9_vu_project`) now emulates the depth
-clamp: a vertex behind the eye is given a small positive w and nearest depth, as the other back
-ends' clamped depth does.
-`BT3_D3D9_PIXEL_DEPTH=1` is an experimental parity check: it compiles a `ps_3_0` variant that
-reproduces the GS per-pixel depth quantization for VU4 draws that use the full-depth pipeline.
-It is off by default and may reduce performance by limiting early depth rejection; it has not
-yet been shown to fix the disappearing terrain.
-`BT3_D3D9_VU4_TRACE=1` records VU4 draw bounds, scissor, depth state, per-side trivial rejects,
-and a CPU clip-space comparison every 30 frames. `clip_survival_d3d_only` / `clip_survival_gl_only`
-count triangles left after clipping by D3D9's six homogeneous planes versus OpenGL's four X/Y
-planes with depth clamp. `onscreen_depth_diff_triangles` counts positive-W triangles whose
-projected polygons have a depth difference at pixel-center locations after clipping to the target
-and draw scissor, when D3D9 clamps per vertex but OpenGL depth-clamps after interpolation. This is
-a CPU model, not a GPU capture, so matching results rule out only these modeled differences and do
-not prove identical rasterization or depth-buffer behavior.
-
-After invalidating the D3D9 scissor cache after target/viewport setup, a lightweight 1x, 640x480
-arena trace recorded 79 VU4 draws across four sampled frames: all reported `state_match=1`, and
-the modeled D3D-only / GL-only clip-survival counts were zero. The 29 modeled depth-difference
-triangles had their maximum differences on the draw-scissor edges; this does not explain the
-interior terrain boundary in the screenshot. The scissor-state mismatch is corrected, but this
-change has not been shown to fix the disappearing terrain.
+- Shaders: the three vertex programs and gs.frag as `vs_3_0` / `ps_3_0` HLSL, compiled at start with
+  d3dcompiler_47.dll (a CPU-transform and fixed-function fallback remains). Vu0Uniform is c0..c19 (c19: the
+  glow work buffers' scale), c20 the D3D9 half-pixel offset. The pixel shader divides the GS's s, t by q per
+  pixel (2D primitives), takes 2D sprites' texture coordinate at the GS pixel (gs.frag's misc.w rules), FBA,
+  the texture-pack alpha rules and TEST.DATE from a copy of the alpha bytes.
+- Near plane: D3D9 clips at z = 0 and z = w, the others clamp depth. A vertex in front of the camera has its
+  depth clamped into [0, w] (no clipping); a VU draw with a vertex at or behind the camera's plane (found on the
+  processor from the w row of its screen matrix) is drawn with the `DEPTH_CLAMP` variant: z = w / 2 keeps
+  everything in front of the camera and the pixel shader writes the depth (the ground under a low camera; the
+  earlier w = 1e-4 trick threw stage triangles across the whole screen). Pre-transformed 2D vertices have their
+  depth clamped to [0, 1]: the game's font glyphs come with z far above 1 and were clipped (names and help lines
+  were missing). `BT3_D3D9_DEPTH_CLAMP=0` switches the variant off.
+- Depth fog / the glare's input (native 3, source 0) reads the real depth from an `INTZ` depth texture
+  (`BT3_D3D9_INTZ=0`: the 8 bits kept in the auxiliary target's G instead, which make the stage glow).
+- Native passes: 1 (outline.frag), 3 (dclut.frag), 4 / 5 (copies of the alpha bytes, only the part the following
+  passes read: aux_region, GsDraw_DateRegion), 100 / 101 (movies: a default-pool surface StretchRect accepts).
+  Not yet: 6 (a script mod's look; the shared layer adds it for the SDL GPU back end only) and gswb.frag
+  (key bit 25, only with `BT3_GLOW_NATIVE=0` at 2x and above).
+- The second render target (the alpha bytes) is left out after a target's last reader of the frame
+  (`BT3_D3D9_AUX_ALL=1`: always written). Flat shadows use the stencil (key bit 24).
+- The window: a back buffer the size of the largest display, presented with a source rectangle (resizing and
+  F11 need no reset); F1's settings window through ImGui's DX9 backend; V-sync from the settings (a device reset).
+  The default internal resolution is 1x (`BT3_SCALE` or the saved setting for more).
+- GT 610, a fight: 2.9 ms of the frame at 1x, 8.6 ms at 2x (vsync on, `BT3_D3D9_TELEMETRY=1`).
+- Diagnostics: `BT3_SHOT` / `BT3_SHOT_DIR` (also for OpenGL), `BT3_D3D9_DUMP_FRAME=<n>` (the draw list of a frame),
+  `BT3_D3D9_DUMP_VERTS=<draw>` (its vertices and texture), `BT3_D3D9_TELEMETRY=1`, `BT3_D3D9_VU4_TRACE=1`,
+  `BT3_D3D9_PIXEL_SHADER=0` (the fixed-function stage), `BT3_D3D9_PIXEL_DEPTH=1` (every full-depth VU4 draw
+  through the depth-writing pixel shader).
 
 ## Renderer fixes after the user looked at the window (2026-10-06)
 

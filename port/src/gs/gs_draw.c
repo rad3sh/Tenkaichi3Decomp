@@ -2641,6 +2641,12 @@ void GsGpu_SetSettings(const PortVideo *v) {
     if (v->vsync != now.vsync) { /* (whichever back end draws) */
         GsGpu_Vsync(v->vsync);
         GsGl_Vsync(v->vsync);
+#ifdef _WIN32
+        {
+            extern void GsD3d9_Vsync(int on); /* gs_d3d9.c */
+            GsD3d9_Vsync(v->vsync);
+        }
+#endif
         Port_SettingSave("vsync", v->vsync);
     }
     sDisplaySetting = v->display;
@@ -2674,12 +2680,12 @@ int GsGpu_Init(void) {
     const char *api = getenv("BT3_GPU_API");
     GsBackend *sb;
 
-    /* D3D9 is kept for older GPUs and its render targets are much more expensive than the SDL GPU path. Use
-       native internal resolution by default for that backend; BT3_SCALE or the saved setting still opts into 2x+. */
+    /* D3D9 is kept for older GPUs (the settings window's Renderer, gpu_api 3, or BT3_GPU_API=d3d9): their fill
+       rate is small, so its internal resolution is the PS2's unless BT3_SCALE or the saved setting asks for more. */
     {
         int defaultScale = 2;
 #ifdef _WIN32
-        if (getenv("BT3_GPU_API") != NULL && strcmp(getenv("BT3_GPU_API"), "d3d9") == 0) {
+        if ((api != NULL && strcmp(api, "d3d9") == 0) || ((api == NULL || strcmp(api, "auto") == 0) && Port_Setting("gpu_api", 0) == 3)) {
             defaultScale = 1;
         }
 #endif
@@ -2695,8 +2701,14 @@ int GsGpu_Init(void) {
     /* BT3_GPU_API=vulkan|gl|auto picks the back end. Both are complete renderers of the same list, so a
        picture from either should be the same (see the frame-by-frame compare in the port's docs). */
     if (api == NULL || strcmp(api, "auto") == 0) {
-        /* the settings window's choice (Renderer; Vulkan unless OpenGL was picked there) */
-        sb = Port_Setting("gpu_api", 0) == 1 ? &sGlBackend : &sVulkanBackend;
+        /* the settings window's choice (Renderer; Vulkan unless OpenGL, or Direct3D 9 on Windows, was picked there) */
+        int choice = Port_Setting("gpu_api", 0);
+        sb = choice == 1 ? &sGlBackend : &sVulkanBackend;
+#ifdef _WIN32
+        if (choice == 3) {
+            sb = &sD3d9Backend;
+        }
+#endif
         api = NULL;
     } else if (strcmp(api, "vk") == 0 || strcmp(api, "vulkan") == 0) {
         sb = &sVulkanBackend;
@@ -2715,11 +2727,16 @@ int GsGpu_Init(void) {
         /* The chosen renderer cannot start (no Vulkan driver, an old graphics card): the other one is tried,
            unless one was asked for by name. */
         GsBackend *other = sb == &sVulkanBackend ? &sGlBackend : &sVulkanBackend;
+#ifdef _WIN32
+        if (sb == &sD3d9Backend) {
+            other = &sGlBackend; /* (the card Direct3D 9 is chosen for has no Vulkan) */
+        }
+#endif
         sBackend = NULL;
         if (api != NULL) {
             return 0;
         }
-        fprintf(stderr, "bt3: the %s renderer could not start; trying %s\n", sb == &sVulkanBackend ? "Vulkan" : "OpenGL",
+        fprintf(stderr, "bt3: the %s renderer could not start; trying %s\n", sb->name,
                 other == &sVulkanBackend ? "Vulkan" : "OpenGL");
         sb = other;
         sBackend = sb;
@@ -5163,6 +5180,11 @@ void GsGpu_InterpPump(int ahead_ms, int all) {
 }
 
 int GsGpu_BackendIsGl(void) {
+#ifdef _WIN32
+    if (sBackend == &sD3d9Backend) {
+        return 1; /* (Direct3D 9: its device is one thread's too) */
+    }
+#endif
     return sBackend == &sGlBackend;
 }
 

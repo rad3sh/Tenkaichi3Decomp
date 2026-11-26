@@ -23,6 +23,7 @@
 #include <string.h>
 #include "gs_internal.h"
 #include "gs_draw.h"
+#include "ui.h"
 
 extern SDL_Window *GsDraw_WindowCreate(int opengl);
 extern int Port_PageAspectMilli(void);
@@ -274,6 +275,8 @@ static D3d9Texture *sWhite;
 static D3d9Target sTargets[MAX_TARGETS];
 static int sTextureCount;
 static int sDeviceLost;
+static int sD3d9ResetPending;  /* the presentation parameters changed (V-sync): reset after this frame */
+static char sAdapterName[512]; /* for the settings window */
 static int sPipeCount;
 static uint32_t sPipeKeys[1024];
 /* Keep the auxiliary attachment in the same format as the colour target so native alpha snapshots can use
@@ -1244,13 +1247,42 @@ static int d3d9_create_device(void) {
     }
     memset(&sPresent, 0, sizeof(sPresent));
     sPresent.Windowed = TRUE;
-    sPresent.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    /* The back buffer is as large as the largest display and only its top left corner, the window's size, is
+       shown (Present with a source rectangle, which needs the copy swap effect): the window can be resized or go
+       full screen (F11) without a device reset. */
+    sPresent.SwapEffect = D3DSWAPEFFECT_COPY;
     sPresent.BackBufferFormat = D3DFMT_X8R8G8B8;
-    sPresent.BackBufferWidth = 0;
-    sPresent.BackBufferHeight = 0;
+    {
+        int count = 0, k, bw = 640, bh = 480, ww = 0, wh = 0;
+        SDL_DisplayID *displays = SDL_GetDisplays(&count);
+        for (k = 0; displays != NULL && k < count; k++) {
+            SDL_Rect r;
+            if (SDL_GetDisplayBounds(displays[k], &r)) {
+                const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(displays[k]);
+                int w = r.w, h = r.h;
+                if (mode != NULL && mode->pixel_density > 1.0f) {
+                    w = (int)((float)w * mode->pixel_density + 0.5f);
+                    h = (int)((float)h * mode->pixel_density + 0.5f);
+                }
+                if (w > bw) bw = w;
+                if (h > bh) bh = h;
+            }
+        }
+        SDL_free(displays);
+        if (SDL_GetWindowSizeInPixels(sWindow, &ww, &wh)) {
+            if (ww > bw) bw = ww;
+            if (wh > bh) bh = wh;
+        }
+        sPresent.BackBufferWidth = (UINT)bw;
+        sPresent.BackBufferHeight = (UINT)bh;
+    }
     /* The game clock is a 30 Hz tick, but the renderer must not free-run its presentation. Present interval one
-       gives DX9 the same vblank pacing as the other backends; BT3_D3D9_VSYNC=0 remains an explicit low-latency escape. */
-    sD3d9Vsync = getenv("BT3_D3D9_VSYNC") == NULL || atoi(getenv("BT3_D3D9_VSYNC")) != 0;
+       gives DX9 the same vblank pacing as the other backends; BT3_D3D9_VSYNC=0 (or V-sync off in the settings
+       window, F1 > Video) presents at once. */
+    {
+        extern int Port_Setting(const char *name, int def);
+        sD3d9Vsync = getenv("BT3_D3D9_VSYNC") != NULL ? atoi(getenv("BT3_D3D9_VSYNC")) != 0 : Port_Setting("vsync", 1) != 0;
+    }
     sPresent.PresentationInterval = sD3d9Vsync ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
 
     sD3d = Direct3DCreate9(D3D_SDK_VERSION);
@@ -1260,6 +1292,7 @@ static int d3d9_create_device(void) {
     }
     if (sD3d->lpVtbl->GetAdapterIdentifier(sD3d, D3DADAPTER_DEFAULT, 0, &adapter) == D3D_OK) {
         fprintf(stderr, "bt3: D3D9 adapter: %s, driver %s\n", adapter.Description, adapter.Driver);
+        snprintf(sAdapterName, sizeof(sAdapterName), "%s (Direct3D 9)", adapter.Description);
     }
     if (sD3d->lpVtbl->GetDeviceCaps(sD3d, D3DADAPTER_DEFAULT, type, &caps) == D3D_OK) {
         sD3d9MrtReady = caps.NumSimultaneousRTs >= 2;
@@ -1278,6 +1311,13 @@ static int d3d9_create_device(void) {
         sDepthFormat = D3DFMT_D32;
     }
     hr = sD3d->lpVtbl->CreateDevice(sD3d, D3DADAPTER_DEFAULT, type, (HWND)hwnd, behavior, &sPresent, &sDevice);
+    {   /* lost while the desktop is locked or a secure screen is up: wait a little for it to come back */
+        int tries;
+        for (tries = 0; hr == D3DERR_DEVICELOST && tries < 50; tries++) {
+            Sleep(100);
+            hr = sD3d->lpVtbl->CreateDevice(sD3d, D3DADAPTER_DEFAULT, type, (HWND)hwnd, behavior, &sPresent, &sDevice);
+        }
+    }
     if (FAILED(hr)) {
         behavior = D3DCREATE_SOFTWARE_VERTEXPROCESSING;
         hr = sD3d->lpVtbl->CreateDevice(sD3d, D3DADAPTER_DEFAULT, type, (HWND)hwnd, behavior, &sPresent, &sDevice);
@@ -1319,6 +1359,7 @@ static void d3d9_draw_gs(const GsDraw *draw);
 static int d3d9_target_read(int index, uint8_t *rgba);
 static uint32_t d3d9_draw_key(const GsDraw *draw);
 static void d3d9_shadow_run_begin(int target);
+static void d3d9_target_ensure(int index);
 
 static int d3d9_gs_stream_ensure(uint32_t count) {
     IDirect3DVertexBuffer9 *buffer;
@@ -1493,7 +1534,13 @@ static int d3d9_init(void) {
     d3d9_vu_shaders_init();
     /* Init GS pixel shader even when VU shaders failed (also used for non-VU draws). */
     if (!sGsPsReady) d3d9_gs_ps_init();
-    fprintf(stderr, "bt3: D3D9 bootstrap backend initialized\n");
+#ifndef D3D9_BACKEND_PROBE
+    /* the overlay (F1's settings, the online window): ImGui's DX9 backend */
+    if (!Ui_InitD3D9(sWindow, sDevice, sAdapterName)) {
+        fprintf(stderr, "bt3: d3d9: the settings window is not available\n");
+    }
+#endif
+    fprintf(stderr, "bt3: D3D9 backend initialized\n");
     return 1;
 }
 
@@ -1501,21 +1548,168 @@ static int d3d9_init(void) {
 static int d3d9_fb_upload_texture(int index);
 #endif
 
+/* The shared recorder belongs to the backend contract: every completed frame consumes its list (as the SDL GPU and
+   OpenGL back ends do); without it D3D9 would replay all previous draws again. */
+static void d3d9_list_consume(void) {
+#ifndef D3D9_BACKEND_PROBE
+    uint32_t i;
+    for (i = 0; i < (uint32_t)gsTargetCount; i++) {
+        gsTargets[i].draws = 0;
+    }
+    gsVertCount = 0;
+    gsVuVertCount = 0;
+    gsVuIdxCount = 0;
+    gsVuUniCount = 0;
+    gsDrawCount = 0;
+    gsAnchor = 0;
+    gsSkipped = 0;
+    gsNative = 0;
+#endif
+}
+
+/* Everything in the default pool goes before IDirect3DDevice9::Reset (a lost device, a changed V-sync) and is
+   made again after: the targets of the shared table now (their pictures are gone: cleared at their next use),
+   the buffers and copies when next needed. Managed textures survive. */
+static int d3d9_reset_device(void) {
+    HRESULT hr;
+    int i;
+    if (sDevice == NULL) {
+        return 0;
+    }
+#ifndef D3D9_BACKEND_PROBE
+    Ui_D3D9Lost(1);
+#endif
+    d3d9_aux_copy_release();
+    for (i = 0; i < 2; i++) {
+        d3d9_texture_release(sFbTex[i]);
+        sFbTex[i] = NULL;
+    }
+    for (i = 0; i < MAX_TARGETS; i++) {
+        d3d9_target_release(&sTargets[i]);
+    }
+    if (sVuVb) { sVuVb->lpVtbl->Release(sVuVb); sVuVb = NULL; sVuVbCapacity = 0; }
+    if (sVuIb) { sVuIb->lpVtbl->Release(sVuIb); sVuIb = NULL; sVuIbCapacity = 0; }
+    if (sGsVb) { sGsVb->lpVtbl->Release(sGsVb); sGsVb = NULL; }
+    free(sGsVertices);
+    sGsVertices = NULL;
+    sGsVertexCapacity = 0;
+    if (sBackbuffer != NULL) {
+        sBackbuffer->lpVtbl->Release(sBackbuffer);
+        sBackbuffer = NULL;
+    }
+    sBoundRt0 = sBoundRt1 = sBoundDs = NULL;
+    sPresent.PresentationInterval = sD3d9Vsync ? D3DPRESENT_INTERVAL_ONE : D3DPRESENT_INTERVAL_IMMEDIATE;
+    hr = sDevice->lpVtbl->Reset(sDevice, &sPresent);
+    if (FAILED(hr)) {
+        if (hr != D3DERR_DEVICELOST) d3d9_log_hr("Reset", hr);
+        return 0;
+    }
+    sDevice->lpVtbl->GetRenderTarget(sDevice, 0, &sBackbuffer);
+#ifndef D3D9_BACKEND_PROBE
+    for (i = 0; i < gsTargetCount; i++) {
+        d3d9_target_ensure(i);
+        gsTargets[i].cleared = 0;
+    }
+    Ui_D3D9Lost(0);
+#endif
+    d3d9_reset_state_cache();
+    sD3d9AppliedPipeline = UINT32_MAX;
+    sD3d9BoundTexture = sD3d9BoundTexture1 = UINTPTR_MAX;
+    fprintf(stderr, "bt3: d3d9: device reset (V-sync %s)\n", sD3d9Vsync ? "on" : "off");
+    return 1;
+}
+
+/* The settings window's "V-sync" (F1 > Video): the presentation interval is one of the device's parameters. */
+void GsD3d9_Vsync(int on) {
+    if (sDevice != NULL && (on != 0) != (sD3d9Vsync != 0)) {
+        sD3d9Vsync = on != 0;
+        sD3d9ResetPending = 1;
+    }
+}
+
+/* A strip of pre-rendered names (the added stages / songs) as a texture for the overlay (ui.cpp). */
+void *GsD3d9_StripTexture(const void *rgba, int w, int h) {
+    IDirect3DTexture9 *texture = NULL;
+    D3DLOCKED_RECT locked;
+    int x, y;
+    if (sDevice == NULL || rgba == NULL || w <= 0 || h <= 0 ||
+        FAILED(sDevice->lpVtbl->CreateTexture(sDevice, (UINT)w, (UINT)h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &texture, NULL))) {
+        return NULL;
+    }
+    if (SUCCEEDED(texture->lpVtbl->LockRect(texture, 0, &locked, NULL, 0))) {
+        for (y = 0; y < h; y++) {
+            const uint8_t *src = (const uint8_t *)rgba + (size_t)y * (size_t)w * 4;
+            uint8_t *dst = (uint8_t *)locked.pBits + (size_t)y * locked.Pitch;
+            for (x = 0; x < w; x++) {
+                dst[x * 4 + 0] = src[x * 4 + 2];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4 + 0];
+                dst[x * 4 + 3] = src[x * 4 + 3];
+            }
+        }
+        texture->lpVtbl->UnlockRect(texture, 0);
+    }
+    return texture;
+}
+
+void GsD3d9_StripTextureFree(void *texture) {
+    if (texture != NULL) {
+        ((IDirect3DTexture9 *)texture)->lpVtbl->Release((IDirect3DTexture9 *)texture);
+    }
+}
+
+#ifndef D3D9_BACKEND_PROBE
+/* The window's events, as gs_gl.c handles them: closing, the overlay (F1, START + SELECT), Esc, F9, F11. */
+static void d3d9_events(void) {
+    extern void PortA11y_Event(const SDL_Event *ev);
+    SDL_Event ev;
+    GsGpu_TitlePoll();
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_EVENT_QUIT) { exit(0); }
+        PortA11y_Event(&ev); /* a11y.c: the repeat key and button */
+        if (PortInput_Hotkey(&ev)) { Ui_Toggle(); continue; }
+        if (Ui_Event(&ev)) { continue; }
+        if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { if (!ev.key.repeat && !Ui_QuitAsk()) { exit(0); } }
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* in-between pictures on / off */
+            extern int gsInterp;
+            extern void Port_SettingSave(const char *name, int value);
+            extern void Port_SettingsWrite(void);
+            static int was = 1;
+            if (gsInterp > 0) { was = gsInterp; gsInterp = 0; } else { gsInterp = was; }
+            Port_SettingSave("interp", gsInterp);
+            Port_SettingsWrite();
+            fprintf(stderr, "bt3: smooth motion %s\n", gsInterp == 0 ? "off" : gsInterp == 1 ? "60" : gsInterp == 2 ? "120" : "240");
+        }
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F11) { GsDraw_FullscreenToggle(); }
+    }
+}
+#endif
+
 static void d3d9_frame_end(void) {
     HRESULT hr;
     uint32_t i;
     uint64_t start = GetTickCount64();
     d3d9_telemetry_frame_begin();
+#ifndef D3D9_BACKEND_PROBE
+    d3d9_events();
+#else
     SDL_PumpEvents();
+#endif
     if (sDevice == NULL) {
         return;
     }
     if (sDeviceLost) {
         hr = sDevice->lpVtbl->TestCooperativeLevel(sDevice);
-        if (hr == D3DERR_DEVICELOST) {
+        if (hr == D3DERR_DEVICENOTRESET && d3d9_reset_device()) {
+            sDeviceLost = 0;
+        } else if (hr != D3D_OK) {
+            d3d9_list_consume(); /* (nothing can be drawn: this frame's list is dropped) */
             return;
+        } else {
+            sDeviceLost = 0;
         }
-        sDeviceLost = 0;
+        d3d9_list_consume(); /* (the list holds the targets of before the reset) */
+        return;
     }
     d3d9_bind_backbuffer();
     sCurrentTarget = -1;
@@ -1530,11 +1724,13 @@ static void d3d9_frame_end(void) {
     hr = sDevice->lpVtbl->Clear(sDevice, 0, NULL, D3DCLEAR_TARGET, D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
     if (FAILED(hr)) {
         d3d9_log_hr("Clear", hr);
+        d3d9_list_consume();
         return;
     }
     hr = sDevice->lpVtbl->BeginScene(sDevice);
     if (FAILED(hr)) {
         d3d9_log_hr("BeginScene", hr);
+        d3d9_list_consume();
         return;
     }
     /* Upload VU vertices + indices once per frame into persistent GPU buffers. */
@@ -1650,10 +1846,25 @@ static void d3d9_frame_end(void) {
         sDevice->lpVtbl->SetIndices(sDevice, NULL);
     }
     d3d9_present_target();
+#ifndef D3D9_BACKEND_PROBE
+    d3d9_bind_backbuffer();
+    Ui_DrawGL(); /* the overlay, over the presented picture (ImGui's DX9 backend restores the state it changes) */
+    sD3d9AppliedPipeline = UINT32_MAX;
+    sD3d9BoundTexture = sD3d9BoundTexture1 = UINTPTR_MAX;
+    sD3d9ScissorValid = 0;
+#endif
     sDevice->lpVtbl->EndScene(sDevice);
     {
         uint64_t presentStart = d3d9_now_ns();
-        hr = sDevice->lpVtbl->Present(sDevice, NULL, NULL, NULL, NULL);
+        RECT shown = {0, 0, 0, 0};
+        int width = 0, height = 0;
+        if (!SDL_GetWindowSizeInPixels(sWindow, &width, &height)) {
+            SDL_GetWindowSize(sWindow, &width, &height);
+        }
+        shown.right = width < (int)sPresent.BackBufferWidth ? width : (LONG)sPresent.BackBufferWidth;
+        shown.bottom = height < (int)sPresent.BackBufferHeight ? height : (LONG)sPresent.BackBufferHeight;
+        /* (the window's part of the large back buffer, onto the whole client area) */
+        hr = sDevice->lpVtbl->Present(sDevice, shown.right > 0 && shown.bottom > 0 ? &shown : NULL, NULL, NULL, NULL);
         if (sD3d9Telemetry.enabled) sD3d9Telemetry.presentNs = d3d9_now_ns() - presentStart;
     }
     /* BT3_SHOT=<n>: every n frames, write the shown buffer's picture (512 x 448 RGBA) as a PPM, as the
@@ -1710,22 +1921,13 @@ static void d3d9_frame_end(void) {
     d3d9_telemetry_log_frame(d3d9_now_ns() - sD3d9Telemetry.frameStartNs);
     sD3d9DrawCount = 0;
     sD3d9VuVertexCount = 0;
-#ifndef D3D9_BACKEND_PROBE
-    /* The shared recorder belongs to the backend contract: every completed frame consumes its list. The SDL GPU
-       backend performs this reset here as well; without it D3D9 replays all previous draws and the frame cost grows
-       continuously during animation and video playback. */
-    for (i = 0; i < (uint32_t)gsTargetCount; i++) {
-        gsTargets[i].draws = 0;
+    d3d9_list_consume();
+    if (sD3d9ResetPending && !sDeviceLost) {
+        sD3d9ResetPending = 0;
+        if (!d3d9_reset_device()) {
+            sDeviceLost = 1;
+        }
     }
-    gsVertCount = 0;
-    gsVuVertCount = 0;
-    gsVuIdxCount = 0;
-    gsVuUniCount = 0;
-    gsDrawCount = 0;
-    gsAnchor = 0;
-    gsSkipped = 0;
-    gsNative = 0;
-#endif
 }
 
 static void d3d9_scale_changed(void) {

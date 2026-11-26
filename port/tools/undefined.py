@@ -259,6 +259,8 @@ def main():
     # an object of the library built before it was given lacks them (delete port/build/obj/cxx_imgui*.o once).
     imgui = ROOT / "port/third_party/imgui"
     for f in sorted(imgui.glob("*.cpp")) + sorted((ROOT / "port/src/gs").glob("*.cpp")):
+        if f.name == "imgui_impl_dx9.cpp" and not WIN:  # Direct3D 9: Windows only (gs_d3d9.c is too)
+            continue
         o = OBJ / ("cxx_" + f.stem + ".o")
         if f.parent == imgui and o.exists() and o.stat().st_mtime > f.stat().st_mtime:
             objs.append(str(o))
