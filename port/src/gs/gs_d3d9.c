@@ -296,6 +296,15 @@ static D3d9Texture *sFbTex[2]; /* display-buffer pictures uploaded directly by t
 static unsigned char sTargetSeen[MAX_TARGETS];
 #endif
 static int sCurrentTarget = -1;
+/* What is bound now (SetRenderTarget resets the viewport and scissor, so it is only called on a change). */
+static IDirect3DSurface9 *sBoundRt0, *sBoundRt1, *sBoundDs;
+/* The draw being replayed writes the alpha bytes (the auxiliary target, render target 1) only when a later pass
+   of the frame reads that target's bytes: a copy for the outline / the table passes (native 4), for the
+   destination alpha test (native 5), or a table pass on the ids (native 3, source 1). After a target's last such
+   reader nothing reads what is written there before its next clear, so the second render target is left out:
+   half the pixel writes of the frame's last layers (gs_gpu.c does the same with key bit 26). */
+static int sD3d9AuxWanted = 1;
+static int sD3d9AuxLastRead[MAX_TARGETS];
 static D3d9Vertex *sVuVertices;
 static uint32_t sVuVertexCapacity;
 /* Dynamic stream for ordinary GS/2D draws. DrawPrimitiveUP forces the runtime to copy every draw through a
@@ -1089,7 +1098,10 @@ static int d3d9_snapshot_ensure(D3d9Texture **snapshot, uint32_t width, uint32_t
     return 1;
 }
 
-static int d3d9_aux_snapshot_to(int targetIndex, D3d9Texture **snapshot, const char *name) {
+/* A copy of target i's alpha bytes (the auxiliary target) for the passes that read them. `rect` (at SCALE): only
+   the part those passes read (aux_region / GsDraw_DateRegion); NULL: all of it. A whole copy of a 1024 x 1024
+   target at 2x is 16 MB read and written, some fifteen times a fight frame on a small chip. */
+static int d3d9_aux_snapshot_to(int targetIndex, D3d9Texture **snapshot, const char *name, const RECT *rect) {
     D3d9Target *target;
     HRESULT hr;
     if (targetIndex < 0 || targetIndex >= MAX_TARGETS || sDevice == NULL) {
@@ -1105,8 +1117,9 @@ static int d3d9_aux_snapshot_to(int targetIndex, D3d9Texture **snapshot, const c
         d3d9_log_hr("SetRenderTarget(snapshot unbind)", hr);
         return 0;
     }
-    hr = sDevice->lpVtbl->StretchRect(sDevice, target->aux->surface, NULL,
-                                      (*snapshot)->surface, NULL, D3DTEXF_NONE);
+    sBoundRt1 = NULL;
+    hr = sDevice->lpVtbl->StretchRect(sDevice, target->aux->surface, rect,
+                                      (*snapshot)->surface, rect, D3DTEXF_NONE);
     if (FAILED(hr)) {
         d3d9_log_hr("StretchRect(snapshot)", hr);
         return 0;
@@ -1114,8 +1127,8 @@ static int d3d9_aux_snapshot_to(int targetIndex, D3d9Texture **snapshot, const c
     return 1;
 }
 
-static int d3d9_aux_snapshot(int targetIndex) {
-    if (!d3d9_aux_snapshot_to(targetIndex, &sD3d9AuxCopy, "auxiliary")) {
+static int d3d9_aux_snapshot_rect(int targetIndex, const RECT *rect) {
+    if (!d3d9_aux_snapshot_to(targetIndex, &sD3d9AuxCopy, "auxiliary", rect)) {
         sD3d9AuxCopyTarget = -1;
         return 0;
     }
@@ -1123,11 +1136,28 @@ static int d3d9_aux_snapshot(int targetIndex) {
     return 1;
 }
 
-static int d3d9_date_snapshot(int targetIndex) {
-    return d3d9_aux_snapshot_to(targetIndex, &sD3d9DateCopy, "DATE");
+static int d3d9_aux_snapshot(int targetIndex) {
+    return d3d9_aux_snapshot_rect(targetIndex, NULL);
+}
+
+static int d3d9_date_snapshot(int targetIndex, const RECT *rect) {
+    return d3d9_aux_snapshot_to(targetIndex, &sD3d9DateCopy, "DATE", rect);
 }
 
 static void d3d9_target_release(D3d9Target *target) {
+    /* (unbound first: a surface made later at the same address must not look bound already) */
+    if (sDevice != NULL && target->aux != NULL && target->aux->surface != NULL && sBoundRt1 == target->aux->surface) {
+        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
+        sBoundRt1 = NULL;
+    }
+    if (sDevice != NULL && target->color != NULL && target->color->surface != NULL && sBoundRt0 == target->color->surface) {
+        if (sBackbuffer != NULL) sDevice->lpVtbl->SetRenderTarget(sDevice, 0, sBackbuffer);
+        sBoundRt0 = sBackbuffer;
+    }
+    if (sDevice != NULL && target->depth != NULL && sBoundDs == target->depth) {
+        sDevice->lpVtbl->SetDepthStencilSurface(sDevice, NULL);
+        sBoundDs = NULL;
+    }
     if (target->depth != NULL) {
         target->depth->lpVtbl->Release(target->depth);
         target->depth = NULL;
@@ -1351,8 +1381,12 @@ static void d3d9_reset_state_cache(void) {
 static void d3d9_bind_backbuffer(void) {
     int width, height;
     if (sDevice != NULL && sBackbuffer != NULL) {
+        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
         sDevice->lpVtbl->SetRenderTarget(sDevice, 0, sBackbuffer);
         sDevice->lpVtbl->SetDepthStencilSurface(sDevice, NULL);
+        sBoundRt0 = sBackbuffer;
+        sBoundRt1 = NULL;
+        sBoundDs = NULL;
         if (!SDL_GetWindowSizeInPixels(sWindow, &width, &height)) {
             SDL_GetWindowSize(sWindow, &width, &height);
         }
@@ -1580,8 +1614,25 @@ static void d3d9_frame_end(void) {
             }
         }
     }
+    {
+        static int auxAll = -1; /* BT3_D3D9_AUX_ALL=1: every draw writes the alpha bytes (to compare) */
+        int t;
+        if (auxAll < 0) auxAll = getenv("BT3_D3D9_AUX_ALL") != NULL && atoi(getenv("BT3_D3D9_AUX_ALL")) != 0;
+        for (t = 0; t < MAX_TARGETS; t++) {
+            sD3d9AuxLastRead[t] = auxAll ? (int)gsDrawCount : -1;
+        }
+        for (i = 0; !auxAll && i < gsDrawCount; i++) {
+            const GsDraw *d = &gsDraws[i];
+            if (d->target >= 0 && d->target < MAX_TARGETS &&
+                (d->native == 4 || d->native == 5 ||
+                 (d->native == 3 && (d->src != 0 || sTargets[d->target].depthTex == NULL)))) {
+                sD3d9AuxLastRead[d->target] = (int)i;
+            }
+        }
+    }
     for (i = 0; i < gsDrawCount; i++) {
         const GsDraw *d = &gsDraws[i];
+        sD3d9AuxWanted = d->target >= 0 && d->target < MAX_TARGETS && (int)i < sD3d9AuxLastRead[d->target];
         if (!d->native && sDepthFormat == D3DFMT_D24S8 && (d3d9_draw_key(d) & (1u << 24)) != 0 &&
             (i == 0 || gsDraws[i - 1].native || gsDraws[i - 1].target != d->target ||
              (d3d9_draw_key(&gsDraws[i - 1]) & (1u << 24)) == 0)) {
@@ -1939,37 +1990,57 @@ static int d3d9_pipe_get(uint32_t key) {
 static void d3d9_set_target(int index) {
     IDirect3DSurface9 *color;
     IDirect3DSurface9 *depth;
+    IDirect3DSurface9 *aux;
     DWORD clearFlags;
     if (index < 0 || index >= MAX_TARGETS || sTargets[index].color == NULL || sDevice == NULL) {
         return;
     }
     color = sTargets[index].color->surface;
     depth = sTargets[index].depth;
-    if (color == NULL || FAILED(sDevice->lpVtbl->SetRenderTarget(sDevice, 0, color))) {
+    aux = sD3d9MrtReady && sD3d9AuxWanted && sTargets[index].aux != NULL ? sTargets[index].aux->surface : NULL;
+    if (color == NULL) {
         return;
     }
-    if (depth != NULL) {
+    if (sBoundRt0 != color) {
+        if (FAILED(sDevice->lpVtbl->SetRenderTarget(sDevice, 0, color))) {
+            return;
+        }
+        sBoundRt0 = color;
+        d3d9_set_viewport((int)sTargets[index].color->width, (int)sTargets[index].color->height);
+        sD3d9ScissorValid = 0;
+    }
+    if (sBoundDs != depth && depth != NULL) {
         sDevice->lpVtbl->SetDepthStencilSurface(sDevice, depth);
+        sBoundDs = depth;
     }
-    if (sD3d9MrtReady && sTargets[index].aux != NULL && sTargets[index].aux->surface != NULL) {
-        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, sTargets[index].aux->surface);
-    } else {
-        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, NULL);
+    if (sBoundRt1 != aux) {
+        sDevice->lpVtbl->SetRenderTarget(sDevice, 1, aux);
+        sBoundRt1 = aux;
     }
-    d3d9_set_viewport((int)sTargets[index].color->width, (int)sTargets[index].color->height);
-    sD3d9ScissorValid = 0;
     if (!d3d9_target_is_cleared(index)) {
         clearFlags = D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER;
         if (sDepthFormat == D3DFMT_D24S8) {
             clearFlags |= D3DCLEAR_STENCIL;
         }
+        if (sD3d9MrtReady && aux == NULL && sTargets[index].aux != NULL && sTargets[index].aux->surface != NULL) {
+            /* (the clear reaches the bytes too, which a later frame's first readers may see) */
+            sDevice->lpVtbl->SetRenderTarget(sDevice, 1, sTargets[index].aux->surface);
+            sBoundRt1 = sTargets[index].aux->surface;
+        }
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, FALSE); /* (Clear honours the scissor) */
         HRESULT hr = sDevice->lpVtbl->Clear(sDevice, 0, NULL,
                                              clearFlags,
                                              D3DCOLOR_ARGB(0, 0, 0, 0), 0.0f, 0);
+        sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_SCISSORTESTENABLE, TRUE);
+        sD3d9ScissorValid = 0;
         if (FAILED(hr)) {
             d3d9_log_hr("Clear(target/depth)", hr);
         } else {
             d3d9_target_set_cleared(index, 1);
+        }
+        if (sBoundRt1 != aux) {
+            sDevice->lpVtbl->SetRenderTarget(sDevice, 1, aux);
+            sBoundRt1 = aux;
         }
     }
     if (sD3d9Telemetry.enabled && sD3d9LastTarget != (uint32_t)index) {
@@ -2814,6 +2885,7 @@ static void d3d9_draw_native3(const GsDraw *draw) {
     if (params[2] != 0.0f) {
         /* the depth is read, so it is not bound for writing during the pass (the pass does not test it) */
         sDevice->lpVtbl->SetDepthStencilSurface(sDevice, NULL);
+        sBoundDs = NULL;
     }
     pipelineKey = draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
     d3d9_apply_pipeline(pipelineKey, draw->blendc);
@@ -2859,6 +2931,7 @@ static void d3d9_draw_native3(const GsDraw *draw) {
         sDevice->lpVtbl->SetTexture(sDevice, 0, NULL);
         sD3d9BoundTexture = 0;
         sDevice->lpVtbl->SetDepthStencilSurface(sDevice, target->depth);
+        sBoundDs = target->depth;
     }
 
     sDevice->lpVtbl->SetRenderState(sDevice, D3DRS_COLORWRITEENABLE1,
@@ -2866,6 +2939,37 @@ static void d3d9_draw_native3(const GsDraw *draw) {
                                      (((pipelineKey >> 16) & GS_CC_A) ? D3DCOLORWRITEENABLE_RED : 0));
     sD3d9AppliedPipeline = UINT32_MAX;
 }
+
+#ifndef D3D9_BACKEND_PROBE
+/* What the passes after the copy of the alpha ids at draw k read of it (gs_gpu.c aux_region): the scissors of the
+   table passes and the outline before the next copy, with the outline's reach round them. 0: nothing. */
+static int d3d9_aux_region(uint32_t k, int *rx, int *ry, int *rw, int *rh) {
+    int W = GS_W * SCALE, H = GS_H * SCALE, m = 8 + 2 * SCALE, x0 = W, y0 = H, x1 = 0, y1 = 0, any = 0;
+    uint32_t i;
+    for (i = k + 1; i < gsDrawCount && gsDraws[i].native != 4; i++) {
+        const GsDraw *d = &gsDraws[i];
+        if (d->native == 3 || d->native == 1 || d->native == 2) {
+            if (d->scissor[0] < x0) { x0 = d->scissor[0]; }
+            if (d->scissor[1] < y0) { y0 = d->scissor[1]; }
+            if (d->scissor[0] + d->scissor[2] > x1) { x1 = d->scissor[0] + d->scissor[2]; }
+            if (d->scissor[1] + d->scissor[3] > y1) { y1 = d->scissor[1] + d->scissor[3]; }
+            any = 1;
+        }
+    }
+    if (!any) {
+        return 0;
+    }
+    x0 = x0 - m < 0 ? 0 : x0 - m;
+    y0 = y0 - m < 0 ? 0 : y0 - m;
+    x1 = x1 + m > W ? W : x1 + m;
+    y1 = y1 + m > H ? H : y1 + m;
+    if (x1 <= x0 || y1 <= y0) {
+        return 0;
+    }
+    *rx = x0, *ry = y0, *rw = x1 - x0, *rh = y1 - y0;
+    return 1;
+}
+#endif
 
 static uint32_t d3d9_draw_key(const GsDraw *draw) {
     return draw->pipeline >= 0 && draw->pipeline < sPipeCount ? sPipeKeys[draw->pipeline] : 0;
@@ -3003,14 +3107,36 @@ static void d3d9_draw_gs(const GsDraw *draw) {
         }
         return;
     }
-    if (draw->native == 4) {
-        d3d9_aux_snapshot(draw->target);
-        return;
-    }
-    if (draw->native == 5) {
-        if (draw->target >= 0 && draw->target < MAX_TARGETS && sTargets[draw->target].color != NULL) {
+    if (draw->native == 4 || draw->native == 5) {
+        RECT rect, *part = NULL;
+#ifndef D3D9_BACKEND_PROBE
+        uint32_t k = (uint32_t)(draw - gsDraws);
+        int rx, ry, rw, rh, any;
+        static int whole = -1;
+        if (whole < 0) whole = getenv("BT3_AUX_COPY_WHOLE") != NULL;
+        if (!gsTargets[draw->target].cleared) {
+            return;
+        }
+        any = draw->native == 4 ? d3d9_aux_region(k, &rx, &ry, &rw, &rh) : GsDraw_DateRegion(k, &rx, &ry, &rw, &rh);
+        if (!any && !whole) {
+            return; /* nothing reads this copy */
+        }
+        if (any && !whole) {
+            rect.left = rx;
+            rect.top = ry;
+            rect.right = rx + rw;
+            rect.bottom = ry + rh;
+            part = &rect;
+        }
+#endif
+        if (draw->target < 0 || draw->target >= MAX_TARGETS || sTargets[draw->target].color == NULL) {
+            return;
+        }
+        if (draw->native == 4) {
+            d3d9_aux_snapshot_rect(draw->target, part);
+        } else {
             d3d9_set_target(draw->target);
-            d3d9_date_snapshot(draw->target);
+            d3d9_date_snapshot(draw->target, part);
         }
         return;
     }
